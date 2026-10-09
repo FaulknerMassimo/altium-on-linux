@@ -1,0 +1,18 @@
+Windows Registry Editor Version 5.00
+
+; Microsoft's open-source Selawik (metric-compatible with Segoe UI), renamed to
+; family "Segoe UI" by fonts/rename_to_segoeui.py, so GDI, DirectWrite and WPF all
+; find it. scripts/install.sh copies the fonts into drive_c/windows/Fonts first.
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\Fonts]
+"Segoe UI (TrueType)"="segoeui-selawik.ttf"
+"Segoe UI Bold (TrueType)"="segoeui-selawikb.ttf"
+"Segoe UI Light (TrueType)"="segoeui-selawikl.ttf"
+"Segoe UI Semibold (TrueType)"="segoeui-selawiksb.ttf"
+"Segoe UI Semilight (TrueType)"="segoeui-selawiksl.ttf"
+
+; Subpixel (RGB) font smoothing, same as winetricks fontsmooth=rgb.
+[HKEY_CURRENT_USER\Control Panel\Desktop]
+"FontSmoothing"="2"
+"FontSmoothingType"=dword:00000002
+"FontSmoothingGamma"=dword:00000578
+"FontSmoothingOrientation"=dword:00000001

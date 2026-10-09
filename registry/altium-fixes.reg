@@ -1,0 +1,15 @@
+Windows Registry Editor Version 5.00
+
+; Proton's tabtip.exe (the Steam Deck on-screen keyboard helper) watches every
+; window through UI Automation. With Altium's WPF windows that turns into an
+; endless loop: Altium freezes, draws black boxes and leaks ~55 MB/s. Disable it.
+[HKEY_CURRENT_USER\Software\Wine\DllOverrides]
+"tabtip.exe"=""
+
+; WPF software rendering. WPF on DXVK's d3d9 can draw black windows.
+[HKEY_CURRENT_USER\Software\Microsoft\Avalon.Graphics]
+"DisableHWAcceleration"=dword:00000001
+
+; Load the SHFolder.dll proxy from Altium's folder instead of Wine's builtin.
+[HKEY_CURRENT_USER\Software\Wine\AppDefaults\X2.EXE\DllOverrides]
+"shfolder"="native,builtin"

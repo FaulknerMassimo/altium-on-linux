@@ -1,0 +1,5 @@
+; Same exports as Wine's shfolder.dll: forwarders to shell32.
+LIBRARY SHFolder.dll
+EXPORTS
+SHGetFolderPathA=shell32.SHGetFolderPathA
+SHGetFolderPathW=shell32.SHGetFolderPathW

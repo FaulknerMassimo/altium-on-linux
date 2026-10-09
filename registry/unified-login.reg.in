@@ -1,0 +1,8 @@
+Windows Registry Editor Version 5.00
+
+; Sign in through the system browser (Altium's System.UnifiedLogin advanced
+; setting). The embedded WebView2 sign-in never renders under Wine.
+; @INSTALL_KEY@ is the "Altium Designer {GUID}" key of your installation;
+; scripts/install.sh fills it in.
+[HKEY_CURRENT_USER\Software\Altium\@INSTALL_KEY@\DesignExplorer\Preferences\AltiumPortal\Account]
+"UnifiedLogin"="1"

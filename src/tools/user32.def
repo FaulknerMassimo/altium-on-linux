@@ -1,0 +1,16 @@
+LIBRARY user32.dll
+EXPORTS
+EnumWindows
+EnumChildWindows
+GetClassNameA
+GetWindowTextA
+GetWindowRect
+IsWindowVisible
+GetWindowLongPtrA
+SetWindowLongPtrA
+SetWindowPos
+RedrawWindow
+GetWindow
+GetParent
+GetWindowThreadProcessId
+wsprintfA
