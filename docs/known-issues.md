@@ -73,8 +73,9 @@ being given a window. That is what VCL does when a control is removed normally.
 
 ## Intermittent freeze while a project loads
 
-Seen twice, not on later runs: the PCB appears but nothing responds. Managed stacks
-(`scripts/dotnet-stacks.sh`) showed the UI thread in
+Seen three times: the documents appear but nothing responds, and the UI thread uses no
+CPU. The first two times, managed stacks (`scripts/dotnet-stacks.sh`) showed the UI thread
+in
 
 ```
 Altium.Har.Core.Project.HarnessReader.LoadDocumentsListParallel
@@ -83,8 +84,43 @@ Altium.Har.Core.Project.HarnessReader.LoadDocumentsListParallel
 
 with no live thread-pool worker to run the tasks it waits for. One worker OS thread had
 disappeared without .NET noticing (`clrthreads` still listed it, `winedbg` did not). The
-project used schematic harness files (`.Harness`). Next step: catch it again with
-`WINEDEBUG=+thread,+seh` to see which thread exits and how.
+project used schematic harness files (`.Harness`).
+
+The third time (2026-10-10, a few minutes after start, with a schematic open) showed what
+the vanished thread leaves behind. The UI thread, 36 `.NET TP Worker` threads and a few
+others were all waiting (`futex`, `FUTEX_WAIT_PRIVATE`) on one `pthread_mutex_t` in
+`ntdll.so`'s `.bss`: Wine's `fd_cache_mutex`, which `server_get_unix_fd` holds while it
+asks wineserver for the Unix file descriptor behind a handle. The mutex's owner was a
+thread that no longer existed. It had died inside that section, so the lock was never
+released: every thread that next needed a file descriptor not yet cached stopped, and the
+.NET thread pool kept adding workers that stopped too. A thread dying there fits
+[Lost connection to wineserver](#lost-connection-to-wineserver): when a thread's pipe to
+wineserver fails, Wine's `abort_thread` ends that thread, whatever locks it holds. Not
+confirmed: Bottles sends Wine's output to `/dev/null`, so there was no log.
+
+To spot it and get Altium going again without a restart (this worked on 2026-10-10):
+
+1. `cat /proc/$PID/task/*/syscall | cut -d' ' -f1-3 | sort | uniq -c`, with `$PID` the
+   host PID of X2.EXE. Dozens of threads in `202 <address> 0x80` with the same address
+   are waiting on one lock.
+2. Check that the address lies in the anonymous mapping right after `ntdll.so` in
+   `/proc/$PID/maps` (in soda-11.0-7 it is `ntdll.so`'s load address + `0xc2a00`). The
+   owner's thread ID is the `int` at address + 8, as seen inside the Flatpak; compare it
+   with the last field of `NSpid` in `/proc/$PID/task/*/status`. No match means the owner
+   is dead.
+3. Clear the lock word, owner and user count, and detach:
+
+   ```bash
+   gdb -q -batch -nx -iex 'set architecture i386:x86-64' -ex 'handle all nostop noprint pass' \
+       -p $PID -ex "set {int}($ADDR+8) = 0" -ex "set {int}($ADDR+12) = 0" \
+       -ex "set {int}$ADDR = 0" -ex detach
+   ```
+
+   Attaching interrupts the waits; when the threads resume, the kernel restarts each
+   wait, which now finds the lock free, and the threads take it in turn.
+
+Next step: run Altium from `scripts/debug-launch.sh` until it happens again, and look for
+`wine client error` in the log just before the freeze.
 
 ## Lost connection to wineserver
 

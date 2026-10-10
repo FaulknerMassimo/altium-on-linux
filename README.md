@@ -24,7 +24,7 @@ redistributed here.
 | PCB and schematic views showing the previous frame | fixed ([§11](docs/how-it-works.md#11-pcb-and-schematic-views-one-frame-behind-vulkan-present-race)) |
 | Heads-up display in the PCB view | fixed ([§14](docs/how-it-works.md#14-heads-up-display-frozen-in-the-pcb-view-layered-child-windows)); drawn over black rather than blended with the board |
 | Dragging floating panels across monitors with different scaling | jitters |
-| Loading a project | occasionally freezes (seen twice) |
+| Loading a project | occasionally freezes (seen three times); can be unfrozen without a restart ([known issues](docs/known-issues.md#intermittent-freeze-while-a-project-loads)) |
 
 The full list, with what is known about each, is in [docs/known-issues.md](docs/known-issues.md).
 
