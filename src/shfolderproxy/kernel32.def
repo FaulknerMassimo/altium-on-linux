@@ -6,3 +6,5 @@ VirtualProtect
 SetLastError
 OutputDebugStringA
 CreateThread
+GetCurrentProcess
+FlushInstructionCache

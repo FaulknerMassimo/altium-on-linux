@@ -170,7 +170,8 @@ another window. Run these tools in the bottle's session (`wine_running` in
 and `WM_CLOSE` (`10`) to the main window to close Altium. Altium ignores the Ctrl bit in
 a posted wheel message (it checks the real key state), so zooming needs the keyboard. Do
 not resize Altium's main window from the compositor in tests (`hyprctl dispatch
-resizewindowpixel`): twice in a row raised `Control 'View…' has no parent window`.
+resizewindowpixel`): twice in a row it raised `Control 'View…' has no parent window`
+(before the fix in [how-it-works §16](how-it-works.md#16-control-view-has-no-parent-window-stale-active-control)).
 
 Posted mouse clicks (`WM_LBUTTONDOWN`/`WM_LBUTTONUP`) on the schematic view do not select
 anything; Altium seems to check the real button state. Posted `WM_MOUSEMOVE`s do not update

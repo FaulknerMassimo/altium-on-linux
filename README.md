@@ -61,6 +61,7 @@ Hyprland rules only matter on Hyprland.
 | 13 | Black box around part of the splash screen | `SHFolder.dll` proxy keeps Wine from cutting transparent pixels out of layered windows |
 | 14 | PCB heads-up display frozen in the view, a live copy in the corner of the screen on every workspace | `SHFolder.dll` proxy draws layered child windows into their parent |
 | 15 | Schematic symbols drawn with arcs (inductors) blank | `SHFolder.dll` proxy implements Direct2D arcs |
+| 16 | Error dialog `Control 'View…' has no parent window`, now and then | `SHFolder.dll` proxy clears a panel's stale focus pointer instead of creating a window for it |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.
@@ -157,7 +158,7 @@ and you can use your license.
 | Where | What | Fix |
 |---|---|---|
 | `Program Files\Altium\AD26\cmd.exe` | shim: opens `cmd /c start <url>` links directly, passes everything else to the real `cmd.exe` | 6 |
-| `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text, layered windows, Direct2D arcs | 9, 10, 12, 13, 14, 15 |
+| `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text, layered windows, Direct2D arcs, stale panel focus | 9, 10, 12, 13, 14, 15, 16 |
 | `Program Files\Altium\AD26\dxvk.conf` | `dxgi.syncInterval = 0` | 11 |
 | `<bottle>/altium-on-linux/vulkan/` | Vulkan layer (Linux library and manifest) that waits for each present | 11 |
 | `windows\Fonts\segoeui-selawik*.ttf` | Selawik renamed to "Segoe UI", built locally from Microsoft's release | 8 |
@@ -205,7 +206,7 @@ fonts/           rename_to_segoeui.py (Selawik -> "Segoe UI")
 registry/        .reg files imported by install.sh
 scripts/         build, install, debugging tools (lib.sh is shared)
 src/cmdshim/     cmd.exe shim
-src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA, Direct2D text, layered windows, Direct2D arcs)
+src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA, Direct2D text, layered windows, Direct2D arcs, VCL focus)
 src/presentwait/ Vulkan layer that waits for each present (Linux)
 src/tools/       wininfo.exe, clearex.exe, postmsg.exe (diagnostics)
 tests/           raw RSA and Direct2D arc tests

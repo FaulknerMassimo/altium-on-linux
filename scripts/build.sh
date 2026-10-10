@@ -19,7 +19,9 @@ for tool in clang lld-link llvm-dlltool; do
 done
 mkdir -p "$OBJ"
 
-CFLAGS=(--target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin
+# -fasynchronous-unwind-tables: -ffreestanding drops the .pdata that lets an exception (a
+# Delphi one, say) unwind through the proxy's hooks.
+CFLAGS=(--target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin -fasynchronous-unwind-tables
         -mno-stack-arg-probe -fno-stack-protector -Wall -Wextra -Werror)
 
 # importlib <def file>: generate an x64 import library from a .def file.

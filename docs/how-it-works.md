@@ -25,6 +25,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 13 | Black box around part of the splash screen | Wine cuts transparent pixels out with an X shape and never paints them; Hyprland ignores X shapes | `SHFolder.dll` proxy (layered windows) |
 | 14 | PCB heads-up display frozen in the view, a live copy in the corner of the screen on every workspace | Wine gives a layered child window its own top-level X window | `SHFolder.dll` proxy (layered child windows) |
 | 15 | Schematic symbols drawn with arcs (inductors) blank | Wine's d2d1 does not implement `ID2D1GeometrySink::AddArc` | `SHFolder.dll` proxy (Direct2D arcs) |
+| 16 | Error dialog `Control 'View…' has no parent window`, now and then | a panel form keeps a removed view as its active control; VCL creates a window for it on the next focus change | `SHFolder.dll` proxy (VCL `DoNestedActivation`) |
 
 ## 1. ICU error in the installer
 
@@ -462,3 +463,56 @@ hook would keep its missing arc. `tests/test_arc.py` checks the conversion on 20
 random arcs against an independent construction. With the fix, the inductor's four loops
 were drawn and nothing else on the sheet changed (an 11 x 85 pixel difference between
 captures, at the loops).
+
+## 16. `Control 'View…' has no parent window` (stale active control)
+
+An error dialog, `Control 'View4296989184' has no parent window at 00000014003A377C` (the
+number changes), came and went. **Continue** dismissed it. Seen after closing the floating
+Messages panel that pops up when a project with warnings opens, while a document was
+loading half a minute after start, after resizing the main window from the compositor
+(`hyprctl dispatch resizewindowpixel`), after dragging a floating panel across monitors, and
+in the component editor.
+
+What happens, from the stack in a `warn+seh` log and from reading the running process.
+X2.EXE ships no symbols, so these names come from Delphi's class tables (VMTs) in the binary:
+
+1. Altium's panels are plain `TCustomForm`s hosted inside dock or floating windows. Closing
+   the Messages panel hides its floating window and removes the panel's content (a
+   `TViewComponent` named `View<address>`) from the form.
+2. In the failing case that form's `ActiveControl` (and its focused control) still pointed
+   at the removed view, which by then had neither a parent nor a window.
+3. The next focus change sends that form `CM_ACTIVATE` or `CM_DEACTIVATE`, and VCL's
+   `DoNestedActivation` (`X2.EXE+3512D0`) walks up from the active control to the nearest
+   form to pass the message on. For the removed view the walk stops at the view itself.
+   Asking it for its window handle makes VCL create the window, which needs a parent, so it
+   raises (`TWinControl.CreateWnd`, `X2.EXE+3A377C`).
+
+Why the form keeps the stale pointer is not known. VCL clears it when a control is hidden or
+removed (`TCustomForm.DefocusControl`), and in two close cycles traced with gdb (breakpoints
+on `SetFocusedControl`, `DefocusControl`, `RemoveControl` and the focus calls in `user32`) it
+did. For both pointers to end up on the view, the view's own window must have got keyboard
+focus after that clean-up, probably while its child windows were being destroyed: when Wine
+hides a focused window, it moves the focus to that window's parent. The error never happened
+while the tracer was attached.
+
+**Fix:** the `SHFolder.dll` proxy replaces `DoNestedActivation` before Altium's own code
+runs (X2.EXE imports the proxy). It finds the routine by its code: 126 bytes that include the
+start of `TCustomForm.Activate` and its call back to the routine, which pins the offsets of
+`Parent` and `ActiveControl`. A jump at the routine's start leads to a C version that does the
+same, except when the walk ends at a control that has no parent and is not a form. Such a
+control is in no form, so it cannot be this form's active control any more: the form's
+`ActiveControl` is cleared, and its focused control too if that is inside the removed control,
+as `DefocusControl` does when a control is removed, and nothing is sent. The C version calls
+VCL's own `is` test, `GetHandle` and `SendMessage`, at addresses read from the matched code.
+The proxy is now built with unwind tables (`-fasynchronous-unwind-tables`), so a Delphi
+exception raised inside `GetHandle` unwinds through it.
+
+The log shows `shfolderproxy: VCL DoNestedActivation replaced in X2.EXE` at start, and
+`shfolderproxy: stale ActiveControl (a removed control) cleared` the first time the fix takes
+over. In the first run with it, that happened 27 s after start, while the previous session's
+documents were reopening, and no error dialog appeared.
+
+Not covered: VCL also uses the active control when a form is activated through
+`WM_ACTIVATE` (`SetWindowFocus`). The fix clears the stale pointer at the first
+`CM_ACTIVATE` or `CM_DEACTIVATE`, so that path would only fail if it came first; it has not
+been seen.

@@ -4,7 +4,8 @@
  * X2.EXE imports SHFolder.dll at startup, so a copy of this DLL placed next to
  * X2.EXE is loaded early. Its exports forward to shell32 like Wine's own
  * shfolder. On load it works around six Wine gaps, in X2.EXE and in every DLL
- * loaded later (via LdrRegisterDllNotification):
+ * loaded later (via LdrRegisterDllNotification), and one VCL bug that shows up
+ * under Wine (7):
  *
  * 1. Missing user32 functions. Altium delay-loads a few newer user32 functions
  *    that Wine does not export (InheritWindowMonitor is still a stub in upstream
@@ -64,6 +65,13 @@
  *    goes in as quadratic curves (d2d_arc.c), from the current point that Wine keeps next to
  *    the sink.
  *
+ * 7. "Control 'View…' has no parent window". A panel form can keep a removed view as its
+ *    ActiveControl. VCL's DoNestedActivation, called whenever the form is activated or
+ *    deactivated, then asks that view for its window handle, and creating a window for a
+ *    control without a parent raises. The routine is found in X2.EXE by its code and
+ *    replaced: for a control that is in no form any more, the form's stale pointers are
+ *    cleared, as VCL does when a control is removed, instead of creating a window.
+ *
  * Build: scripts/build.sh (clang + lld-link + llvm-dlltool; no Windows SDK or CRT needed).
  */
 
@@ -86,8 +94,11 @@ IMPORT void SetLastError(DWORD err);
 IMPORT void OutputDebugStringA(const char *msg);
 IMPORT HANDLE CreateThread(void *attrs, SIZE_T stack, DWORD (*start)(void *), void *arg, DWORD flags, DWORD *tid);
 IMPORT NTSTATUS LdrRegisterDllNotification(DWORD flags, void *callback, void *context, void **cookie);
+IMPORT HANDLE GetCurrentProcess(void);
+IMPORT BOOL FlushInstructionCache(HANDLE process, const void *addr, SIZE_T size);
 
 #define PAGE_READWRITE 0x04
+#define PAGE_EXECUTE_READWRITE 0x40
 #define ERROR_NOT_SUPPORTED 50
 #define DLL_PROCESS_ATTACH 1
 #define LDR_DLL_NOTIFICATION_REASON_LOADED 1
@@ -1029,6 +1040,139 @@ static void d2d1_loaded(BYTE *base)
     CreateThread(0, 0, patch_d2d1, base, 0, 0);
 }
 
+/* ---- 7. Stale ActiveControl of a panel form ------------------------------- */
+
+/* VCL's DoNestedActivation (Vcl.Forms), as compiled into X2.EXE (Delphi 12, x64), followed by
+ * the start of TCustomForm.Activate, which calls it with the form's ActiveControl:
+ *
+ *   procedure DoNestedActivation(Msg: Cardinal; Control: TWinControl; Form: TCustomForm);
+ *   begin
+ *     if Control = nil then Exit;
+ *     while (Control.Parent <> nil) and not (Control is TCustomForm) do Control := Control.Parent;
+ *     if (Control <> nil) and (Control <> Form) then SendMessage(Control.Handle, Msg, 0, 0);
+ *   end;
+ *
+ * ?? are rel32 operands, read from the match: the TCustomForm class (a pointer to it), @IsClass,
+ * TWinControl.GetHandle, SendMessage, and in Activate the call back to the routine. */
+static const char nested_activation_code[] =
+    "57 56 53 48 83 ec 20 89 cb 48 89 d6 4c 89 c7 48 85 f6 74 42 eb 04 48 8b 76 78 48 83 7e 78 00 74 "
+    "13 48 89 f1 48 8b 15 ?? ?? ?? ?? e8 ?? ?? ?? ?? 84 c0 74 e2 48 85 f6 74 1d 48 3b f7 74 18 48 89 "
+    "f1 e8 ?? ?? ?? ?? 48 89 c1 89 da 4d 33 c0 4d 33 c9 e8 ?? ?? ?? ?? 48 83 c4 20 5b 5e 5f c3 cc cc "
+    /* Activate: */ "56 53 48 83 ec 28 48 89 cb c7 c1 00 b0 00 00 48 8b 93 b0 04 00 00 49 89 d8 e8 ?? ?? ?? ??";
+#define NESTED_ACTIVATION_RVA 0x3512d0 /* Altium 26.10.1; other builds are searched for */
+#define NA_FORM_CLASS 39 /* offsets of the rel32 operands */
+#define NA_IS_CLASS 44
+#define NA_GET_HANDLE 66
+#define NA_SEND_MESSAGE 82
+#define NA_ACTIVATE_CALL 122
+
+#define CONTROL_PARENT 0x78        /* TControl.FParent (in the pattern) */
+#define FORM_ACTIVE_CONTROL 0x4b0  /* TCustomForm.FActiveControl (in the pattern) */
+#define FORM_FOCUSED_CONTROL 0x4b8 /* TCustomForm.FFocusedControl, declared right after it */
+#define FIELD(obj, offset) (*(BYTE **)((obj) + (offset)))
+
+typedef BYTE (*is_class_fn)(const BYTE *obj, const void *cls);
+typedef HWND (*get_handle_fn)(BYTE *control);
+typedef LRESULT (*send_message_fn)(HWND hwnd, unsigned msg, WPARAM wp, LPARAM lp);
+
+static void *const *form_class;
+static is_class_fn vcl_is_class;
+static get_handle_fn vcl_get_handle;
+static send_message_fn vcl_send_message;
+
+static int is_form(const BYTE *control) { return vcl_is_class(control, *form_class); }
+
+/* DoNestedActivation, except for an ActiveControl that is in no form any more: the walk up ends
+ * at a control without a parent that is not a form. VCL would ask it for its window handle,
+ * which creates the window, which needs a parent: "Control 'View…' has no parent window". Such
+ * a control has been removed from the form, so the form's pointers to it are cleared the way
+ * TCustomForm.DefocusControl clears them when a control is removed, and nothing is sent. */
+static void nested_activation_hook(DWORD msg, BYTE *control, BYTE *form)
+{
+    static int logged;
+    BYTE *top = control, *p;
+
+    if (!control) return;
+    while (FIELD(top, CONTROL_PARENT) && !is_form(top)) top = FIELD(top, CONTROL_PARENT);
+    if (FIELD(top, CONTROL_PARENT) || is_form(top)) {
+        if (top != form) vcl_send_message(vcl_get_handle(top), msg, 0, 0);
+        return;
+    }
+    if (form && FIELD(form, FORM_ACTIVE_CONTROL) == control) {
+        p = FIELD(form, FORM_FOCUSED_CONTROL);
+        while (p && p != top) p = FIELD(p, CONTROL_PARENT);
+        if (p) FIELD(form, FORM_FOCUSED_CONTROL) = 0;
+        FIELD(form, FORM_ACTIVE_CONTROL) = 0;
+    }
+    if (!logged) {
+        logged = 1;
+        OutputDebugStringA("shfolderproxy: stale ActiveControl (a removed control) cleared\n");
+    }
+}
+
+static int hex_digit(char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; }
+
+/* True if code matches pattern ("xx" or "??" per byte, space-separated) within limit bytes. */
+static int code_matches(const BYTE *code, SIZE_T limit, const char *pattern)
+{
+    for (SIZE_T i = 0; *pattern; i++, pattern += pattern[2] ? 3 : 2) {
+        if (i >= limit) return 0;
+        if (pattern[0] != '?' && code[i] != (BYTE)(hex_digit(pattern[0]) << 4 | hex_digit(pattern[1]))) return 0;
+    }
+    return 1;
+}
+
+static BYTE *rel32_target(BYTE *operand) { return operand + 4 + *(const int *)operand; }
+
+/* The first executable section of a module. */
+static BYTE *code_section(BYTE *base, DWORD *size)
+{
+    BYTE *nt = base + *(DWORD *)(base + 0x3c), *section;
+    WORD count = *(WORD *)(nt + 6);
+
+    section = nt + 0x18 + *(WORD *)(nt + 0x14); /* after the optional header */
+    for (; count--; section += 40)
+        if (*(DWORD *)(section + 36) & 0x20000000) { /* IMAGE_SCN_MEM_EXECUTE */
+            *size = *(DWORD *)(section + 8);
+            return base + *(DWORD *)(section + 12);
+        }
+    return 0;
+}
+
+static int is_nested_activation(BYTE *code, BYTE *end)
+{
+    return code_matches(code, end - code, nested_activation_code)
+            && rel32_target(code + NA_ACTIVATE_CALL) == code;
+}
+
+/* Runs before X2.EXE's own code: SHFolder.dll is one of its imports. */
+static void patch_nested_activation(BYTE *exe)
+{
+    BYTE *text, *end, *code = 0, jump[14] = { 0xff, 0x25 }; /* jmp [rip+0]; dq target */
+    void *target = (void *)nested_activation_hook;
+    DWORD size, old;
+
+    if (!exe || exe[0] != 'M' || exe[1] != 'Z' || !(text = code_section(exe, &size))) return;
+    end = text + size;
+    if (exe + NESTED_ACTIVATION_RVA >= text && exe + NESTED_ACTIVATION_RVA < end
+            && is_nested_activation(exe + NESTED_ACTIVATION_RVA, end))
+        code = exe + NESTED_ACTIVATION_RVA;
+    for (BYTE *p = text; !code && p < end; p++)
+        if (*p == 0x57 && is_nested_activation(p, end)) code = p;
+    if (!code) return;
+
+    form_class = (void *const *)rel32_target(code + NA_FORM_CLASS);
+    vcl_is_class = (is_class_fn)rel32_target(code + NA_IS_CLASS);
+    vcl_get_handle = (get_handle_fn)rel32_target(code + NA_GET_HANDLE);
+    vcl_send_message = (send_message_fn)rel32_target(code + NA_SEND_MESSAGE);
+    memcpy(jump + 6, &target, sizeof(target));
+    if (!VirtualProtect(code, sizeof(jump), PAGE_EXECUTE_READWRITE, &old)) return;
+    memcpy(code, jump, sizeof(jump));
+    VirtualProtect(code, sizeof(jump), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, sizeof(jump));
+    OutputDebugStringA("shfolderproxy: VCL DoNestedActivation replaced in X2.EXE\n");
+}
+
 /* ---- Import table patching ---------------------------------------------- */
 
 static BYTE *data_directory(BYTE *base, int index, DWORD *size)
@@ -1133,6 +1277,7 @@ BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
     (void)self; (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         patch_user32_delay_imports(GetModuleHandleW(0));
+        patch_nested_activation(GetModuleHandleW(0));
         if (is_wine_builtin(GetModuleHandleW(L"user32.dll")))
             patch_imports(GetModuleHandleW(L"user32.dll"), "win32u.dll", win32u_hooks,
                           sizeof(win32u_hooks) / sizeof(win32u_hooks[0]));

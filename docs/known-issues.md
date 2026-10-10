@@ -6,9 +6,9 @@ Contributions welcome: [debugging.md](debugging.md) has the tools.
 ## Panels jitter when dragged across monitors (mixed scaling)
 
 Dragging a floating panel, especially between monitors, makes it jump back and forth;
-once, after that, Altium reported `Control 'View…' has no parent window`. That error has
-other triggers too and is probably not caused by the scaling
-([below](#control-view-has-no-parent-window)).
+once, after that, Altium reported `Control 'View…' has no parent window`. That error had
+other triggers too and is now fixed
+([how-it-works §16](how-it-works.md#16-control-view-has-no-parent-window-stale-active-control)).
 
 Likely cause: with Hyprland's `xwayland:force_zero_scaling = true` (Omarchy's default)
 and monitors with different scales, X11 and Hyprland disagree about coordinates. Here a
@@ -24,52 +24,6 @@ corrects, and the two keep fighting. Toggling `force_zero_scaling` with `hyprctl
 not update XWayland's layout until a restart, so this is untested. Things to try: put the
 external monitor at x=0 (then its X11 and logical coordinates match), or turn
 `force_zero_scaling` off and accept blurrier X11 apps on the laptop screen.
-
-## `Control 'View…' has no parent window`
-
-An error dialog, `Control 'View4296989184' has no parent window at 00000014003A377C`
-(the number changes), that comes and goes. Seen:
-
-- after closing the floating Messages panel that pops up when a project with warnings
-  opens;
-- while a schematic passed on the command line was loading, half a minute after start;
-- after resizing the main window twice from the compositor (`hyprctl dispatch
-  resizewindowpixel`) with a schematic open;
-- once after dragging a floating panel across monitors.
-
-Two later attempts to close the Messages panel, one through closing and reopening the
-project, did not bring it back.
-
-What happens, from the stack in a `warn+seh` log and from reading the running process
-(Altium 26.10.1). X2.EXE ships no symbols, so these names come from Delphi's class
-tables (VMTs) in the binary:
-
-1. Altium's panels are plain `TCustomForm`s hosted inside the dock or floating windows.
-   Closing the Messages panel hides its floating window and removes the panel's content
-   (a `TViewComponent` named `View<address>`) from the form.
-2. In the failing case that form's `ActiveControl` (and its focused control) still
-   pointed at the removed view, which by then had neither a parent nor a window.
-3. The next focus change sends that form `CM_DEACTIVATE`. `TCustomForm.Deactivate`
-   walks up from the active control to its top-most parent and sends it the message.
-   Asking a parentless control for its window handle makes VCL create the window,
-   which needs a parent, so it raises (`TWinControl.CreateWnd`, `X2.EXE+3A377C`).
-
-Why the form keeps the stale pointer is not known. VCL clears it when a control is hidden
-or removed, and in two close cycles traced with gdb (breakpoints on
-`SetFocusedControl`, `DefocusControl`, `RemoveControl` and the focus calls in
-`user32`) it did. For both pointers to end up on the view, the view's own window must
-have got keyboard focus after that clean-up, probably while its child windows were
-being destroyed. When it hides a focused window, Wine moves the focus to that window's
-parent. This is a guess; the error did not happen while the tracer was attached.
-
-**Workaround:** close the dialog with **Continue** (not "Send and Close", which sends a
-crash report); Altium keeps working.
-
-Next steps: catch it under the tracer to see where the focus comes from. Or work around
-it in the `SHFolder.dll` proxy: replace the VCL routine that sends
-`CM_ACTIVATE`/`CM_DEACTIVATE` to the active control (`X2.EXE+3512D0`, found by
-byte pattern) so that a detached control clears the form's stale fields instead of
-being given a window. That is what VCL does when a control is removed normally.
 
 ## Intermittent freeze while a project loads
 
