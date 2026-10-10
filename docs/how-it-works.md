@@ -24,6 +24,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 12 | Schematic text with missing strokes, slow schematic redraws | Wine's d2d1 picks the text rendering mode without the zoom transform, fills glyph outlines unantialiased | `SHFolder.dll` proxy (DirectWrite hooks) |
 | 13 | Black box around part of the splash screen | Wine cuts transparent pixels out with an X shape and never paints them; Hyprland ignores X shapes | `SHFolder.dll` proxy (layered windows) |
 | 14 | PCB heads-up display frozen in the view, a live copy in the corner of the screen on every workspace | Wine gives a layered child window its own top-level X window | `SHFolder.dll` proxy (layered child windows) |
+| 15 | Schematic symbols drawn with arcs (inductors) blank | Wine's d2d1 does not implement `ID2D1GeometrySink::AddArc` | `SHFolder.dll` proxy (Direct2D arcs) |
 
 ## 1. ICU error in the installer
 
@@ -416,3 +417,48 @@ The proxy looks up the `user32` functions it needs at run time instead of import
 build that imported `user32.dll` lost a thread's wineserver connection in both test runs
 (see [known-issues.md](known-issues.md#lost-connection-to-wineserver)).
 
+## 15. Blank schematic symbols: inductors (Direct2D arcs)
+
+Symbols drawn with arcs were blank in the schematic editor: an inductor showed its two pin
+stubs and nothing between them. Full circles (the voltage source) were fine.
+
+Altium's schematic painter (`Direct2DGraphics.DrawArc` in `Altium.GeometryMaker`) draws a
+full circle with `DrawEllipse`, and any other arc as a path geometry with one figure:
+`BeginFigure` at the arc's start point, `AddArc` to its end point, `EndFigure`. Wine 11.0's
+`d2d_geometry_sink_AddArc` (`dlls/d2d1/geometry.c`) is a stub (`FIXME ... stub!`) that only
+adds the end point as a new vertex. Wine stores a segment's type on the vertex it starts
+from, and the stub leaves that one unset (`D2D_VERTEX_TYPE_NONE`), so the outline code
+skips the segment: the arc is not even drawn as a straight line. An inductor from
+Altium's libraries is eight quarter-circle arcs and nothing else.
+
+Evidence: with `--debug fixme-all,fixme+d2d`, opening the "6_Oscillator" example
+(`Examples/Simulation Quick Start`) logged the stub eight times, once per arc of the
+inductor L1 (eight `RECORD=12` arcs owned by L1 in the `.SchDoc`).
+
+**Fix:** once Wine's builtin `d2d1.dll` has loaded, a short thread in the `SHFolder.dll`
+proxy creates a path geometry and replaces the `AddArc` slot of its sink's vtable, which
+every path geometry shares. The replacement converts the arc
+([`d2d_arc.c`](../src/shfolderproxy/d2d_arc.c)) as the SVG implementation notes describe
+(centre from the end points, radii scaled up when too small to reach the end point) into
+quadratic Bézier curves of at most 30 degrees each, and adds them with
+`AddQuadraticBeziers`. Each curve's control point is where the tangents at its ends meet,
+so the curves join without corners and stay within 0.06% of the radius off the ellipse.
+Quadratic, because Wine draws those exactly but approximates each cubic curve with one
+quadratic. An arc with a zero radius goes in as a straight line, as in SVG.
+
+`AddArc` gets only the end point; the start is the figure's current point, which the
+interface does not expose. The proxy reads it from Wine's `struct d2d_geometry`: the figures
+follow the sink in memory, and the current point is the last vertex of the last figure.
+Before replacing anything, the thread checks this on its test path (the current point
+must be found where expected, in the second figure, so the figure size is checked too) and
+that Wine's `AddArc` still leaves a half circle out (the path's `GetBounds` stops at its
+chord); otherwise, as on a Wine that implements arcs, nothing is patched. The log shows
+`shfolderproxy: Direct2D arc hook installed in d2d1.dll`, and one `AddArc` stub line from
+that check.
+
+The thread finished before the schematic view's swapchain was created, so the first frame
+already had the hook; Altium caches each arc's geometry, and a geometry built before the
+hook would keep its missing arc. `tests/test_arc.py` checks the conversion on 20,000
+random arcs against an independent construction. With the fix, the inductor's four loops
+were drawn and nothing else on the sheet changed (an 11 x 85 pixel difference between
+captures, at the loops).

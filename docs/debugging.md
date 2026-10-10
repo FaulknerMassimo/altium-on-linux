@@ -49,6 +49,7 @@ Useful `WINEDEBUG` channels:
 | `+exec,+winebrowser,+process` | `ShellExecute`, link opening, program starts | `cmd /c start` |
 | `+start` | Wine's `start.exe` | the `search_path` overflow |
 | `+thread` | thread names and exits (`RtlProcessFlsData`) | thread-pool workers |
+| `fixme+d2d` (after `fixme-all`) | Direct2D functions Wine has not implemented, each time one is called | `AddArc` |
 | `+timestamp` | a timestamp on every line | timing |
 
 Wine's timestamps are seconds of monotonic time and do not count suspend; to get wall
@@ -196,6 +197,7 @@ Most root causes were confirmed in Wine's source: `programs/start/start.c`
 `X11DRV_client_surface_present`), `dlls/ntdll/loader.c` (when DLL-load notifications
 fire relative to import resolution), `dlls/bcrypt/gnutls.c` at tag `wine-11.0`
 (RSA decryption), `dlls/d2d1/device.c` (`d2d_device_context_draw_glyph_run`),
+`dlls/d2d1/geometry.c` (`d2d_geometry_sink_AddArc`, how path figures are stored),
 `dlls/dwrite/font.c` (recommended rendering mode, glyph cache), `dlls/dwrite/main.c`
 (default rendering parameters) and `dlls/win32u/vulkan.c` (`win32u_vkQueuePresentKHR`,
 which copies off-screen windows right after the host present). GitHub's `wine-mirror/wine`

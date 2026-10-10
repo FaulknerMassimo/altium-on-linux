@@ -3,7 +3,7 @@
  *
  * X2.EXE imports SHFolder.dll at startup, so a copy of this DLL placed next to
  * X2.EXE is loaded early. Its exports forward to shell32 like Wine's own
- * shfolder. On load it works around five Wine gaps, in X2.EXE and in every DLL
+ * shfolder. On load it works around six Wine gaps, in X2.EXE and in every DLL
  * loaded later (via LdrRegisterDllNotification):
  *
  * 1. Missing user32 functions. Altium delay-loads a few newer user32 functions
@@ -56,6 +56,13 @@
  *    same wrapper does not call Wine: it keeps the image composited over black
  *    and draws it into the window, which paints into the main window like any
  *    child, and redraws it whenever the window is repainted, moved or shown.
+ *
+ * 6. Arcs in Direct2D paths (schematic symbols such as inductors). Wine's d2d1 does not
+ *    implement ID2D1GeometrySink::AddArc: it adds the end point without a segment to it, so
+ *    the schematic's arcs (all but full circles) are not drawn. Once Wine's builtin d2d1.dll
+ *    is loaded, and if its AddArc still leaves arcs out, that vtable slot is replaced: the arc
+ *    goes in as quadratic curves (d2d_arc.c), from the current point that Wine keeps next to
+ *    the sink.
  *
  * Build: scripts/build.sh (clang + lld-link + llvm-dlltool; no Windows SDK or CRT needed).
  */
@@ -399,9 +406,9 @@ static void release(void *obj)
     if (obj) ((release_fn)VTBL(obj)[SLOT_RELEASE])(obj);
 }
 
-static void wrap_slot(const BYTE *dwrite, void **slot, void *hook, void **real)
+static void wrap_slot(const BYTE *module, void **slot, void *hook, void **real)
 {
-    if (*slot == hook || !in_image(dwrite, *slot)) return; /* already wrapped, or not Wine's layout */
+    if (*slot == hook || !in_image(module, *slot)) return; /* already wrapped, or not Wine's layout */
     *real = *slot;
     __sync_synchronize(); /* the real pointer is visible before the slot changes */
     set_slot((ULONGLONG *)slot, hook);
@@ -857,6 +864,171 @@ static const struct hook win32u_hooks[] = {
     { "NtUserUpdateLayeredWindow", (void *)update_layered_hook, (void **)&real_update_layered },
 };
 
+/* ---- 6. Arcs in Direct2D paths ------------------------------------------- */
+
+IMPORT double sin(double x);
+IMPORT double cos(double x);
+IMPORT double atan2(double y, double x);
+IMPORT double sqrt(double x);
+
+#include "d2d_arc.c"
+
+typedef struct {
+    arc_point point;
+    float width, height; /* D2D1_SIZE_F */
+    float rotation;
+    int sweep_direction, arc_size;
+} D2D1_ARC_SEGMENT;
+typedef struct { float left, top, right, bottom; } D2D1_RECT_F;
+
+#define D2D1_SWEEP_DIRECTION_CLOCKWISE 1
+#define D2D1_ARC_SIZE_LARGE 1
+#define D2D1_FIGURE_BEGIN_FILLED 0
+#define D2D1_FIGURE_END_CLOSED 1
+
+#define SLOT_D2D_FACTORY_CREATE_PATH_GEOMETRY 10
+#define SLOT_GEOMETRY_GET_BOUNDS 4
+#define SLOT_PATH_GEOMETRY_OPEN 17
+#define SLOT_SINK_BEGIN_FIGURE 5
+#define SLOT_SINK_END_FIGURE 8
+#define SLOT_SINK_CLOSE 9
+#define SLOT_SINK_ADD_LINE 10
+#define SLOT_SINK_ADD_QUADRATIC_BEZIERS 13
+#define SLOT_SINK_ADD_ARC 14
+
+static const GUID IID_ID2D1Factory = { 0x06152247, 0x6f50, 0x465a, { 0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07 } };
+
+/* A path geometry being built in Wine's d2d1 (struct d2d_geometry and struct d2d_figure in
+ * dlls/d2d1): the ID2D1GeometrySink is followed by the figures, and the current point is the
+ * last vertex of the last figure. Checked on a test path before AddArc is replaced. */
+struct wine_d2d_figure {
+    arc_point *vertices;
+    SIZE_T vertices_size;
+    void *vertex_types;
+    SIZE_T vertex_types_size;
+    SIZE_T vertex_count;
+    void *bezier_controls;
+    SIZE_T bezier_controls_size, bezier_control_count;
+    void *original_bezier_controls;
+    SIZE_T original_bezier_controls_size, original_bezier_control_count;
+    D2D1_RECT_F bounds;
+    unsigned flags;
+};
+_Static_assert(sizeof(struct wine_d2d_figure) == 112, "d2d_figure layout");
+
+struct wine_d2d_path_sink {
+    void *vtbl;
+    struct wine_d2d_figure *figures;
+    SIZE_T figures_size, figure_count;
+    int state;
+};
+
+#define WINE_D2D_STATE_FIGURE 4 /* D2D_GEOMETRY_STATE_FIGURE: between BeginFigure and EndFigure */
+
+static int current_point(void *sink, arc_point *point)
+{
+    const struct wine_d2d_path_sink *path = sink;
+    const struct wine_d2d_figure *figure;
+
+    if (path->state != WINE_D2D_STATE_FIGURE || !path->figure_count || path->figure_count > path->figures_size)
+        return 0;
+    figure = &path->figures[path->figure_count - 1];
+    if (!figure->vertex_count) return 0;
+    *point = figure->vertices[figure->vertex_count - 1];
+    return 1;
+}
+
+typedef void (*add_arc_fn)(void *sink, const D2D1_ARC_SEGMENT *arc);
+typedef void (*add_line_fn)(void *sink, arc_point point);
+typedef void (*add_quadratics_fn)(void *sink, const arc_quadratic *curves, DWORD count);
+
+static add_arc_fn real_add_arc;
+
+static void add_arc_hook(void *sink, const D2D1_ARC_SEGMENT *arc)
+{
+    arc_quadratic curves[ARC_QUADRATICS_MAX];
+    arc_point from;
+    unsigned n;
+
+    if (!current_point(sink, &from)) {
+        real_add_arc(sink, arc); /* outside a figure: Wine's error */
+        return;
+    }
+    n = arc_to_quadratics(from, arc->point, arc->width, arc->height, arc->rotation,
+                          arc->sweep_direction == D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                          arc->arc_size == D2D1_ARC_SIZE_LARGE, curves);
+    if (n)
+        ((add_quadratics_fn)VTBL(sink)[SLOT_SINK_ADD_QUADRATIC_BEZIERS])(sink, curves, n);
+    else /* a zero radius: a straight line, as in SVG */
+        ((add_line_fn)VTBL(sink)[SLOT_SINK_ADD_LINE])(sink, arc->point);
+}
+
+typedef HRESULT (*d2d_create_factory_fn)(int type, const GUID *iid, const void *options, void **factory);
+typedef HRESULT (*create_fn)(void *obj, void **out);
+typedef void (*begin_figure_fn)(void *sink, arc_point start, int figure_begin);
+typedef void (*end_figure_fn)(void *sink, int figure_end);
+typedef HRESULT (*close_fn)(void *sink);
+typedef HRESULT (*get_bounds_fn)(void *geometry, const void *transform, D2D1_RECT_F *bounds);
+
+/* On a new path: a triangle, then a 10 x 4 box whose right side is a half circle of radius 2
+ * bulging to the right. True if the current point is found where current_point() looks (in
+ * the second figure, so the figure size is checked too) and Wine's AddArc leaves the half
+ * circle out (the box ends at x = 10, not 12). */
+static int add_arc_missing(void *path, void *sink)
+{
+    static const arc_point triangle[] = { { -10, 0 }, { -6, 0 }, { -6, 4 } }, box[] = { { 0, 0 }, { 10, 0 }, { 0, 4 } };
+    static const D2D1_ARC_SEGMENT half_circle = { { 10, 4 }, 2, 2, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, 0 };
+    void **sink_vtbl = VTBL(sink);
+    begin_figure_fn begin = (begin_figure_fn)sink_vtbl[SLOT_SINK_BEGIN_FIGURE];
+    add_line_fn add_line = (add_line_fn)sink_vtbl[SLOT_SINK_ADD_LINE];
+    end_figure_fn end = (end_figure_fn)sink_vtbl[SLOT_SINK_END_FIGURE];
+    D2D1_RECT_F bounds;
+    arc_point at;
+
+    begin(sink, triangle[0], D2D1_FIGURE_BEGIN_FILLED);
+    add_line(sink, triangle[1]);
+    add_line(sink, triangle[2]);
+    end(sink, D2D1_FIGURE_END_CLOSED);
+    begin(sink, box[0], D2D1_FIGURE_BEGIN_FILLED);
+    add_line(sink, box[1]);
+    if (((struct wine_d2d_path_sink *)sink)->figure_count != 2 || !current_point(sink, &at)
+            || at.x != box[1].x || at.y != box[1].y)
+        return 0;
+    ((add_arc_fn)sink_vtbl[SLOT_SINK_ADD_ARC])(sink, &half_circle);
+    add_line(sink, box[2]);
+    end(sink, D2D1_FIGURE_END_CLOSED);
+    return ((close_fn)sink_vtbl[SLOT_SINK_CLOSE])(sink) >= 0
+            && ((get_bounds_fn)VTBL(path)[SLOT_GEOMETRY_GET_BOUNDS])(path, 0, &bounds) >= 0
+            && bounds.right == box[1].x;
+}
+
+/* On its own thread, like patch_dwrite: d2d1 cannot be used from the load notification. */
+static DWORD patch_d2d1(void *module)
+{
+    d2d_create_factory_fn create = (d2d_create_factory_fn)GetProcAddress(module, "D2D1CreateFactory");
+    void *factory = 0, *path = 0, *sink = 0;
+
+    if (!create || create(0 /* SINGLE_THREADED */, &IID_ID2D1Factory, 0, &factory) < 0) return 1;
+    /* The sink's vtable is shared by every path geometry. */
+    if (((create_fn)VTBL(factory)[SLOT_D2D_FACTORY_CREATE_PATH_GEOMETRY])(factory, &path) >= 0
+            && ((create_fn)VTBL(path)[SLOT_PATH_GEOMETRY_OPEN])(path, &sink) >= 0
+            && add_arc_missing(path, sink))
+        wrap_slot(module, &VTBL(sink)[SLOT_SINK_ADD_ARC], (void *)add_arc_hook, (void **)&real_add_arc);
+
+    release(sink);
+    release(path);
+    release(factory);
+    if (real_add_arc) OutputDebugStringA("shfolderproxy: Direct2D arc hook installed in d2d1.dll\n");
+    return 0;
+}
+
+static void d2d1_loaded(BYTE *base)
+{
+    static volatile long started;
+    if (!is_wine_builtin(base) || __sync_lock_test_and_set(&started, 1)) return;
+    CreateThread(0, 0, patch_d2d1, base, 0, 0);
+}
+
 /* ---- Import table patching ---------------------------------------------- */
 
 static BYTE *data_directory(BYTE *base, int index, DWORD *size)
@@ -951,6 +1123,8 @@ static void dll_loaded(DWORD reason, const DLL_NOTIFICATION_DATA *data, void *co
         patch_imports(data->dll_base, "bcrypt.dll", bcrypt_hooks, sizeof(bcrypt_hooks) / sizeof(bcrypt_hooks[0]));
     else if (wname_is(data->base_name->buffer, data->base_name->length / 2, "dwrite.dll"))
         dwrite_loaded(data->dll_base);
+    else if (wname_is(data->base_name->buffer, data->base_name->length / 2, "d2d1.dll"))
+        d2d1_loaded(data->dll_base);
 }
 
 BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
@@ -964,6 +1138,7 @@ BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
                           sizeof(win32u_hooks) / sizeof(win32u_hooks[0]));
         LdrRegisterDllNotification(0, (void *)dll_loaded, 0, &cookie);
         if (GetModuleHandleW(L"dwrite.dll")) dwrite_loaded(GetModuleHandleW(L"dwrite.dll"));
+        if (GetModuleHandleW(L"d2d1.dll")) d2d1_loaded(GetModuleHandleW(L"d2d1.dll"));
     }
     return 1;
 }
