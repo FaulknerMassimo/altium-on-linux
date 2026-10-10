@@ -126,7 +126,7 @@ expected.
 With Altium and the Bottles window closed:
 
 ```bash
-git clone <this repository> altium-on-linux && cd altium-on-linux
+git clone https://github.com/FaulknerMassimo/altium-on-linux.git && cd altium-on-linux
 scripts/install.sh            # --dry-run to see what it would do; --help for options
 ```
 
