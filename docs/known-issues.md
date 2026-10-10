@@ -77,8 +77,6 @@ sign-in step and installed normally; sign in afterwards from Altium.
 
 ## Smaller things
 
-- **Layer switches one step behind:** [`config/dxvk.conf`](../config/dxvk.conf) is the
-  fix in progress (see [how-it-works.md §11](how-it-works.md#11-pcb-view-one-step-behind-experimental)); not yet confirmed.
 - **Orange box** at the bottom-left of the PCB view, origin unknown.
 - **"Not Signed In"** after starting Altium with a file on the command line; the license
   still works. Sign in from the account menu if needed.
@@ -100,4 +98,5 @@ sign-in step and installed normally; sign in afterwards from Altium.
 | `FontSubstitutes` Segoe UI -> Selawik | fixed only part of the UI; replaced by the renamed font |
 | Disable TLS 1.3 in schannel | no effect; the PCB crash was `bcrypt`, not TLS |
 | WineD3D (OpenGL) for Altium's Direct3D 11 | still one frame behind, and slower |
+| `dxgi.syncInterval = 0` alone for the frame-behind views | PCB view mostly right, schematic still one frame behind; the present-wait layer fixes both ([how-it-works.md §11](how-it-works.md#11-pcb-and-schematic-views-one-frame-behind-vulkan-present-race)) |
 | Faking an older Windows version for `InheritWindowMonitor` | the call has no version check |

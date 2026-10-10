@@ -33,6 +33,12 @@ scripts/debug-launch.sh --debug fixme-all,warn+seh,+timestamp,+loaddll \
     "$HOME/.var/app/com.usebottles.bottles/data/bottles/bottles/Altium/drive_c/users/Public/Documents/Altium/MyBoard.PcbDoc"
 ```
 
+`--env NAME=VALUE` (repeatable) adds a variable after the bottle's own, for A/B runs:
+`DISABLE_ALTIUM_PRESENT_WAIT=1` starts Altium without the present-wait layer
+(how-it-works §11), `ALTIUM_PRESENT_WAIT_DEBUG=1` makes the layer log every wait
+(`altium-present-wait: present 31: waited 19.17 ms`). `grep VkLayer /proc/<pid>/maps`
+shows whether the layer is loaded.
+
 Useful `WINEDEBUG` channels:
 
 | Channel | Shows | Found |
@@ -165,10 +171,20 @@ a posted wheel message (it checks the real key state), so zooming needs the keyb
 not resize Altium's main window from the compositor in tests (`hyprctl dispatch
 resizewindowpixel`): twice in a row raised `Control 'View…' has no parent window`.
 
+Posted mouse clicks (`WM_LBUTTONDOWN`/`WM_LBUTTONUP`) on the schematic view do not select
+anything; Altium seems to check the real button state. The main window's handle changes
+from run to run: look it up with `wininfo.sh` (`cls=TDocumentForm`) before sending
+`WM_CLOSE`. After Altium exits, its WebView2 processes can keep the bottle's wineserver
+running, and `debug-launch.sh` refuses to start until they are gone; once `X2.EXE` has
+exited, `in_running_bottle "$RUNNER_DIR/bin/wineserver" -k` ends them.
+
 To see a window without screenshotting the desktop, which may show something else on
 top, capture it through X11: `xprop -root _NET_CLIENT_LIST` lists Altium's X window ids,
 and `import -window <id> out.png` (ImageMagick) saves that window's contents even when
-another window covers it.
+another window covers it. The capture is what Wine copied into the top-level window, so
+it also shows whether a view is a frame behind: post one wheel step at a time (down,
+down, up), capture after each, and measure how far the content moved. A view that is a
+frame behind shows each step one step late, and the first not at all.
 
 ## Reading Wine's source
 
@@ -178,6 +194,11 @@ Most root causes were confirmed in Wine's source: `programs/start/start.c`
 `X11DRV_client_surface_present`), `dlls/ntdll/loader.c` (when DLL-load notifications
 fire relative to import resolution), `dlls/bcrypt/gnutls.c` at tag `wine-11.0`
 (RSA decryption), `dlls/d2d1/device.c` (`d2d_device_context_draw_glyph_run`),
-`dlls/dwrite/font.c` (recommended rendering mode, glyph cache) and `dlls/dwrite/main.c`
-(default rendering parameters). GitHub's `wine-mirror/wine` serves raw files when GitLab's bot
-protection blocks scripted downloads.
+`dlls/dwrite/font.c` (recommended rendering mode, glyph cache), `dlls/dwrite/main.c`
+(default rendering parameters) and `dlls/win32u/vulkan.c` (`win32u_vkQueuePresentKHR`,
+which copies off-screen windows right after the host present). GitHub's `wine-mirror/wine`
+serves raw files when GitLab's bot protection blocks scripted downloads; the runner's own
+source is Valve's `ValveSoftware/wine` (branch `bleeding-edge` for soda's
+"experimental.bleeding.edge" builds). Below Wine: Mesa's
+`src/vulkan/wsi/wsi_common_x11.c` (the X11 present queue and present wait) and Xwayland's
+`hw/xwayland/xwayland-present.c` (when copies are done and reported complete).

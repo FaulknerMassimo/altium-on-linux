@@ -21,7 +21,7 @@ redistributed here.
 | Home page, menus, Preferences | work |
 | PCB editor, 2D and 3D | works |
 | Schematic editor | opens and redraws, text fixed ([§12](docs/how-it-works.md#12-schematic-text-broken-and-redraws-slow-direct2d-text)); editing untested |
-| PCB view redraw after a layer switch | one step behind; fix in testing ([§11](docs/how-it-works.md#11-pcb-view-one-step-behind-experimental)) |
+| PCB and schematic views showing the previous frame | fixed ([§11](docs/how-it-works.md#11-pcb-and-schematic-views-one-frame-behind-vulkan-present-race)) |
 | Heads-up display in the PCB view | dark box; press Shift+H to hide it |
 | Dragging floating panels across monitors with different scaling | jitters |
 | Loading a project | occasionally freezes (seen twice) |
@@ -56,7 +56,7 @@ Hyprland rules only matter on Hyprland.
 | 8 | Whole UI in Times New Roman | Microsoft's Selawik, renamed to "Segoe UI" |
 | 9 | File menu / right-click: `External exception C06D007F` | `SHFolder.dll` proxy supplies `InheritWindowMonitor` |
 | 10 | Opening a PCB closes Altium (`GnuTLS error: Decryption has failed`) | `SHFolder.dll` proxy does raw RSA for the Simbeor license check |
-| 11 | PCB view one step behind | `dxvk.conf`: `dxgi.syncInterval = 0` (experimental) |
+| 11 | PCB and schematic views one frame behind: a click selects, but the highlight shows up only with the next redraw | Vulkan layer waits for each present before Wine copies the view; `dxvk.conf`: `dxgi.syncInterval = 0` |
 | 12 | Schematic text with missing strokes and underscores, slow redraws | `SHFolder.dll` proxy routes Direct2D text through DirectWrite bitmaps |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
@@ -140,6 +140,7 @@ re-run, and ends with a check:
     ok   Segoe UI font
     ok   browser sign-in
     ok   SteamAppId
+    ok   present-wait layer
 ```
 
 ### 7. Sign in
@@ -157,23 +158,25 @@ In the PCB editor, press **Shift+H** to hide the heads-up display until it is fi
 | `Program Files\Altium\AD26\cmd.exe` | shim: opens `cmd /c start <url>` links directly, passes everything else to the real `cmd.exe` | 6 |
 | `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text | 9, 10, 12 |
 | `Program Files\Altium\AD26\dxvk.conf` | `dxgi.syncInterval = 0` | 11 |
+| `<bottle>/altium-on-linux/vulkan/` | Vulkan layer (Linux library and manifest) that waits for each present | 11 |
 | `windows\Fonts\segoeui-selawik*.ttf` | Selawik renamed to "Segoe UI", built locally from Microsoft's release | 8 |
 | `HKCU\Software\Wine\DllOverrides` | `tabtip.exe` disabled | 4 |
 | `HKCU\Software\Wine\AppDefaults\X2.EXE\DllOverrides` | `shfolder` = `native,builtin` | 9, 10 |
 | `HKCU\Software\Microsoft\Avalon.Graphics` | WPF software rendering | 4 |
 | `HKCU\Software\Altium\Altium Designer {…}\…\AltiumPortal\Account` | `UnifiedLogin` = `1` | 5 |
 | `HKLM\…\Fonts`, `HKCU\Control Panel\Desktop` | register the fonts, RGB font smoothing | 8 |
-| `bottle.yml` | `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1`, `SteamAppId=altium` | 1, 2 |
+| `bottle.yml` | `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1`, `SteamAppId=altium`, `VK_ADD_IMPLICIT_LAYER_PATH=<bottle>/altium-on-linux/vulkan` | 1, 2, 11 |
 
-The shims are freestanding C (no C runtime, no Windows headers) built with
-`scripts/build.sh`; each source file explains what it does and why.
+The shims are freestanding C (no C runtime, no Windows headers) and the Vulkan layer is
+plain C without Vulkan headers, all built with `scripts/build.sh`; each source file
+explains what it does and why.
 
 **After updating Altium** to a new major version (a new `AD27` folder), run
 `scripts/install.sh` again: it targets the newest `AD*` folder.
 
 **To undo:** delete `cmd.exe`, `SHFolder.dll` and `dxvk.conf` from Altium's folder (or
-restore the `.bak` copies) and the `shfolder` value under `AppDefaults\X2.EXE`; the
-other changes are harmless to keep.
+restore the `.bak` copies), the `shfolder` value under `AppDefaults\X2.EXE` and the
+bottle variable `VK_ADD_IMPLICIT_LAYER_PATH`; the other changes are harmless to keep.
 
 ## Debugging
 
@@ -201,6 +204,7 @@ registry/        .reg files imported by install.sh
 scripts/         build, install, debugging tools (lib.sh is shared)
 src/cmdshim/     cmd.exe shim
 src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA, Direct2D text)
+src/presentwait/ Vulkan layer that waits for each present (Linux)
 src/tools/       wininfo.exe, clearex.exe, postmsg.exe (diagnostics)
 tests/           raw RSA test
 ```

@@ -1,0 +1,14 @@
+{
+    "file_format_version": "1.1.2",
+    "layer": {
+        "name": "VK_LAYER_altium_present_wait",
+        "type": "GLOBAL",
+        "library_path": "./VkLayer_altium_present_wait.so",
+        "api_version": "1.4.0",
+        "implementation_version": "1",
+        "description": "Wait for each present to complete, so Wine copies the new frame of a child window",
+        "disable_environment": {
+            "DISABLE_ALTIUM_PRESENT_WAIT": "1"
+        }
+    }
+}

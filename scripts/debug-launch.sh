@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Start Altium the way Bottles does, but with Wine/DXVK output in a log file.
 #
-#   scripts/debug-launch.sh [--bottle NAME] [--debug CHANNELS] [--log FILE] [DOCUMENT]
+#   scripts/debug-launch.sh [--bottle NAME] [--debug CHANNELS] [--log FILE] [--env NAME=VALUE]... [DOCUMENT]
 #
 #   --debug   WINEDEBUG channels (default: fixme-all,warn+seh,+timestamp)
 #             e.g. +loaddll (which DLLs load, and where), +bcrypt, +exec,+winebrowser
 #             (link opening), +process (programs started), +thread
 #   --log     log file (default: <bottle>/altium-on-linux/logs/altium-<time>.log)
+#   --env     extra environment variable, after the bottle's own (repeatable), e.g.
+#             DISABLE_ALTIUM_PRESENT_WAIT=1 for a run without the present-wait layer
 #   DOCUMENT  a file to open on start (host or Windows path), e.g. a .PcbDoc; handy
 #             for reproducing a problem without clicking through the UI.
 #
@@ -20,12 +22,14 @@ BOTTLE=Altium
 CHANNELS=fixme-all,warn+seh,+timestamp
 LOG=
 DOC=
+EXTRA_ENV=()
 while [ $# -gt 0 ]; do
     case $1 in
         --bottle) BOTTLE=$2; shift 2 ;;
         --debug) CHANNELS=$2; shift 2 ;;
         --log) LOG=$2; shift 2 ;;
-        -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --env) EXTRA_ENV+=("$2"); shift 2 ;;
+        -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *) DOC=$1; shift ;;
     esac
@@ -50,6 +54,7 @@ env_args=(
 while IFS= read -r line; do env_args+=("$line"); done < <(
     awk '/^Environment_Variables:/{on=1; next} on && /^    [A-Za-z_][A-Za-z0-9_]*: /{sub(/^    /,""); k=$1; sub(/:$/,"",k);
          $1=""; v=substr($0,2); gsub(/^'"'"'|'"'"'$/,"",v); print k"="v; next} on{exit}' "$BOTTLE_DIR/bottle.yml")
+env_args+=("${EXTRA_ENV[@]}")
 
 args=("C:\\Program Files\\Altium\\$ALTIUM_DIR\\X2.EXE")
 [ -z "$DOC" ] || args+=("$DOC")

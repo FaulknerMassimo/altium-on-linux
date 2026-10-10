@@ -20,7 +20,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 8 | Whole UI in Times New Roman | no Segoe UI | Selawik renamed to "Segoe UI" |
 | 9 | File menu / right-click: `External exception C06D007F` | `user32!InheritWindowMonitor` missing in Wine | `SHFolder.dll` proxy |
 | 10 | Opening a PCB kills Altium (`GnuTLS error: Decryption has failed`) | Wine's GnuTLS `bcrypt` ignores `BCRYPT_PAD_NONE` | `SHFolder.dll` proxy (raw RSA) |
-| 11 | PCB view one step behind on layer switches | Wine copies the off-screen child window before vsync updates it | `dxgi.syncInterval = 0` (experimental) |
+| 11 | PCB and schematic views one frame behind (a selection shows up only with the next redraw) | Wine copies an off-screen child window before Mesa's X11 present has updated it | Vulkan layer that waits for each present to complete |
 | 12 | Schematic text with missing strokes, slow schematic redraws | Wine's d2d1 picks the text rendering mode without the zoom transform, fills glyph outlines unantialiased | `SHFolder.dll` proxy (DirectWrite hooks) |
 
 ## 1. ICU error in the installer
@@ -219,24 +219,67 @@ with Montgomery multiplication, for moduli up to 2048 bits. Every other call goe
 Wine's `bcrypt`. [`tests/test_rsa.py`](../tests/test_rsa.py) checks it against Python's
 `pow()` on random 512- to 2048-bit keys.
 
-## 11. PCB view one step behind (experimental)
+## 11. PCB and schematic views one frame behind (Vulkan present race)
 
-Switching from the top to the bottom layer showed the top layer until the next redraw;
-switching back showed the bottom layer.
+The views showed the frame before the current one. In the schematic, clicking a
+component showed no selection; clicking a second one showed the first one selected. In
+the PCB editor, switching from the top to the bottom layer showed the top layer until
+the next redraw.
 
-The PCB view is a child window. Wine's X11 driver renders every child window
-off-screen (`needs_offscreen_rendering()` returns TRUE when the parent is not the
-desktop) and, on each Present, copies the off-screen image into the top-level window
-(`X11DRV_client_surface_present`). Altium presents with vsync (`VK_PRESENT_MODE_FIFO`),
-so the X server only updates the off-screen image at the next vertical blank, after
-Wine has already copied it: the copy is always the previous frame.
+Both views are child windows drawn with Direct3D 11 through DXVK (the schematic with
+Wine's `d2d1` on top), so they end up as Vulkan swapchains. Wine's X11 driver renders a
+child window's swapchain off-screen (`needs_offscreen_rendering()` returns TRUE when the
+parent is not the desktop). In win32u's `vkQueuePresentKHR`, as soon as the host
+`vkQueuePresentKHR` returns, it copies the off-screen window into the top-level window
+(`client_surface_present` -> `X11DRV_client_surface_present`). Upstream Wine does the
+same.
 
-Routing Direct3D 11 through WineD3D (OpenGL) instead of DXVK did not help and was
-slower.
+At that point the host present has not happened yet. Mesa's X11 WSI
+(`src/vulkan/wsi/wsi_common_x11.c`, `x11_queue_present`) only puts the image on a queue.
+Its "WSI swapchain queue" thread waits for rendering to finish (in FIFO mode, for the
+previous present to complete) and only then sends `PresentPixmap`, and in FIFO mode the
+X server waits for its next tick before doing the copy. Wine's copy usually runs first
+and gets the previous frame, and nothing copies the window again until the next present.
 
-**Fix (unverified):** [`config/dxvk.conf`](../config/dxvk.conf) with
-`dxgi.syncInterval = 0`, so presents are immediate. DXVK reads `dxvk.conf` from the
-working directory, which Bottles sets to Altium's folder.
+To see it without clicking, post three wheel steps (down, down, up) to the view and
+capture the window through X11 after each one (see debugging.md). The content should
+move one step, two steps, then back to one step:
+
+| | down | down | up |
+|---|---|---|---|
+| schematic, no fix | 0 px | -30 px | -60 px |
+| schematic, fix | -30 px | -60 px | -30 px |
+| PCB, fix | -80 px | -160 px | -80 px |
+
+The first attempt, `dxgi.syncInterval = 0` in [`config/dxvk.conf`](../config/dxvk.conf),
+makes DXVK present without vsync (`VK_PRESENT_MODE_IMMEDIATE_KHR`), so the X server does
+the copy as soon as it gets the image. Whether that happens before Wine's copy is a race.
+With it, the PCB view usually got the right frame (it passed the test above without the
+layer), but the schematic, whose Direct2D frames take longer to render, lost every time.
+Routing Direct3D 11 through WineD3D (OpenGL) instead of DXVK did not help and was slower.
+
+**Fix:** [`src/presentwait`](../src/presentwait/presentwait.c), a Vulkan layer loaded by
+the host Vulkan loader (on the Linux side, inside the Bottles sandbox), between Wine and
+Mesa. After `vkQueuePresentKHR` it calls `vkWaitForPresentKHR` with the present ID that
+DXVK attaches to every present (DXVK enables `VK_KHR_present_id` and
+`VK_KHR_present_wait` when the driver has them, as Mesa does). It returns once the X
+server reports the present complete, and Wine then copies the new frame. Presents without
+an ID, and devices without present wait, pass through unchanged. A wait gives up after
+100 ms.
+
+Each present waits about 19 ms. Xwayland does the copy at once but reports it complete on
+its next tick (`xwl_present_execute` queues the completion for `crtc_msc + 1`; the tick is
+a 17 ms timer for windows it does not show itself). DXVK presents from its own thread, so
+Altium's UI thread does not block, but a view now redraws at most about 50 times a
+second. `dxvk.conf` stays: in FIFO mode Xwayland would also delay the copy itself to a
+tick, making each wait up to a tick longer.
+
+`scripts/install.sh` copies the layer and its manifest
+([`VkLayer_altium_present_wait.json`](../src/presentwait/VkLayer_altium_present_wait.json))
+to `<bottle>/altium-on-linux/vulkan` and sets the bottle variable
+`VK_ADD_IMPLICIT_LAYER_PATH` to that folder, so no other bottle loads it.
+`DISABLE_ALTIUM_PRESENT_WAIT=1` turns it off for a run, and
+`ALTIUM_PRESENT_WAIT_DEBUG=1` logs every wait.
 
 ## 12. Schematic text broken and redraws slow (Direct2D text)
 
