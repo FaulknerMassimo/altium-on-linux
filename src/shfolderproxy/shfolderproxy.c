@@ -3,7 +3,7 @@
  *
  * X2.EXE imports SHFolder.dll at startup, so a copy of this DLL placed next to
  * X2.EXE is loaded early. Its exports forward to shell32 like Wine's own
- * shfolder. On load it works around two Wine gaps, in X2.EXE and in every DLL
+ * shfolder. On load it works around four Wine gaps, in X2.EXE and in every DLL
  * loaded later (via LdrRegisterDllNotification):
  *
  * 1. Missing user32 functions. Altium delay-loads a few newer user32 functions
@@ -33,6 +33,18 @@
  *    OUTLINE into NATURAL_SYMMETRIC (antialiased bitmaps), and
  *    CreateGlyphRunAnalysis folds a uniform scale into the em size, advances and
  *    origin, because dwrite bypasses its glyph cache for any transform.
+ *
+ * 4. Black areas around layered windows (the splash screen). For a layered
+ *    window drawn with per-pixel alpha (UpdateLayeredWindow), Wine cuts the
+ *    pixels with alpha 0 out of the X window with an X shape, which it sets
+ *    before painting, so those pixels are never written. On Hyprland
+ *    (XWayland) the shape is not applied, and they show whatever the window's
+ *    buffer held, often opaque black. Wine's user32 passes
+ *    UpdateLayeredWindow(Indirect) on to win32u's NtUserUpdateLayeredWindow,
+ *    however the caller found it (the splash does not use X2.EXE's import of
+ *    UpdateLayeredWindow); that import of user32 is wrapped and gets a copy of
+ *    the bitmap in which alpha-0 pixels have alpha 1 (invisible), so Wine
+ *    paints every pixel.
  *
  * Build: scripts/build.sh (clang + lld-link + llvm-dlltool; no Windows SDK or CRT needed).
  */
@@ -234,7 +246,9 @@ static NTSTATUS destroy_key_hook(HANDLE key)
     return real_destroy_key(key);
 }
 
-static const struct { const char *name; void *hook; void **real; } bcrypt_hooks[] = {
+struct hook { const char *name; void *hook; void **real; };
+
+static const struct hook bcrypt_hooks[] = {
     { "BCryptImportKeyPair", (void *)import_key_pair_hook, (void **)&real_import_key_pair },
     { "BCryptDecrypt", (void *)decrypt_hook, (void **)&real_decrypt },
     { "BCryptDestroyKey", (void *)destroy_key_hook, (void **)&real_destroy_key },
@@ -417,6 +431,130 @@ static void dwrite_loaded(BYTE *base)
     CreateThread(0, 0, patch_dwrite, base, 0, 0);
 }
 
+/* ---- 4. Fully transparent pixels of layered windows --------------------- */
+
+typedef void *HWND;
+typedef void *HDC;
+typedef void *HGDIOBJ;
+typedef struct { int x, y; } POINT;
+typedef struct { int cx, cy; } SIZE;
+typedef struct { BYTE op, flags, constant_alpha, format; } BLENDFUNCTION;
+typedef struct {
+    DWORD size;
+    int width, height;
+    WORD planes, bit_count;
+    DWORD compression, size_image;
+    int x_pels_per_meter, y_pels_per_meter;
+    DWORD clr_used, clr_important;
+} BITMAPINFOHEADER;
+typedef struct {
+    int type, width, height, width_bytes; /* BITMAP */
+    WORD planes, bits_pixel;
+    BYTE *bits;
+    BITMAPINFOHEADER header;
+    DWORD bitfields[3];
+    HANDLE section;
+    DWORD offset;
+} DIBSECTION;
+_Static_assert(sizeof(DIBSECTION) == 104, "DIBSECTION layout");
+
+IMPORT HGDIOBJ GetCurrentObject(HDC hdc, unsigned type);
+IMPORT int GetObjectW(HGDIOBJ obj, int size, void *buffer);
+IMPORT HGDIOBJ CreateDIBSection(HDC hdc, const void *info, unsigned usage, void **bits, HANDLE section, DWORD offset);
+IMPORT HDC CreateCompatibleDC(HDC hdc);
+IMPORT HGDIOBJ SelectObject(HDC hdc, HGDIOBJ obj);
+IMPORT BOOL DeleteDC(HDC hdc);
+IMPORT BOOL DeleteObject(HGDIOBJ obj);
+IMPORT BOOL GdiFlush(void);
+
+#define ULW_ALPHA 2
+#define AC_SRC_ALPHA 1
+#define OBJ_BITMAP 7
+#define BI_RGB 0
+#define DIB_RGB_COLORS 0
+
+/* win32u's NtUserUpdateLayeredWindow: UpdateLayeredWindow plus a dirty rectangle */
+typedef BOOL (*update_layered_fn)(HWND hwnd, HDC dst, const POINT *dst_pos, const SIZE *size, HDC src,
+                                  const POINT *src_pos, DWORD key, const BLENDFUNCTION *blend, DWORD flags,
+                                  const void *dirty);
+
+static update_layered_fn real_update_layered;
+
+/* Row y (from the top) of a 32-bit DIB section. */
+static const DWORD *dib_row(const DIBSECTION *dib, int y)
+{
+    if (dib->header.height > 0) y = dib->header.height - 1 - y; /* bottom-up */
+    return (const DWORD *)(dib->bits + (SIZE_T)y * dib->width_bytes);
+}
+
+/* For per-pixel alpha from a 32-bit DIB section, where alpha 0 means invisible: a top-down copy
+ * of the source area with alpha 1 (and no colour) in place of alpha 0. 0 if there is none to
+ * replace, or for any other source. */
+static HGDIOBJ copy_without_transparent_pixels(HDC src, const POINT *src_pos, const SIZE *size,
+                                               const BLENDFUNCTION *blend, DWORD flags)
+{
+    BITMAPINFOHEADER header = { .size = sizeof(header), .planes = 1, .bit_count = 32, .compression = BI_RGB };
+    int x, y, sx = src_pos ? src_pos->x : 0, sy = src_pos ? src_pos->y : 0, height, transparent = 0;
+    DIBSECTION dib;
+    HGDIOBJ copy;
+    DWORD *bits;
+
+    if (!src || !size || !blend || !(flags & ULW_ALPHA) || !(blend->format & AC_SRC_ALPHA)
+            || GetObjectW(GetCurrentObject(src, OBJ_BITMAP), sizeof(dib), &dib) != sizeof(dib)
+            || !dib.bits || dib.header.bit_count != 32 || dib.header.compression != BI_RGB)
+        return 0;
+    height = dib.header.height < 0 ? -dib.header.height : dib.header.height;
+    if (sx < 0 || sy < 0 || size->cx <= 0 || size->cy <= 0
+            || size->cx > dib.header.width - sx || size->cy > height - sy)
+        return 0;
+
+    GdiFlush();
+    for (y = 0; y < size->cy && !transparent; y++) {
+        const DWORD *row = dib_row(&dib, sy + y) + sx;
+        for (x = 0; x < size->cx && !transparent; x++) transparent = !(row[x] >> 24);
+    }
+    header.width = size->cx;
+    header.height = -size->cy;
+    if (!transparent || !(copy = CreateDIBSection(0, &header, DIB_RGB_COLORS, (void **)&bits, 0, 0))) return 0;
+
+    for (y = 0; y < size->cy; y++) {
+        const DWORD *row = dib_row(&dib, sy + y) + sx;
+        for (x = 0; x < size->cx; x++) *bits++ = row[x] >> 24 ? row[x] : 0x01000000;
+    }
+    return copy;
+}
+
+static BOOL update_layered_hook(HWND hwnd, HDC dst, const POINT *dst_pos, const SIZE *size, HDC src,
+                                const POINT *src_pos, DWORD key, const BLENDFUNCTION *blend, DWORD flags,
+                                const void *dirty)
+{
+    static const POINT origin = { 0, 0 };
+    static int logged;
+    HGDIOBJ copy = copy_without_transparent_pixels(src, src_pos, size, blend, flags), old;
+    HDC hdc = copy ? CreateCompatibleDC(src) : 0;
+    BOOL ret;
+
+    if (!hdc) {
+        if (copy) DeleteObject(copy);
+        return real_update_layered(hwnd, dst, dst_pos, size, src, src_pos, key, blend, flags, dirty);
+    }
+    old = SelectObject(hdc, copy);
+    ret = real_update_layered(hwnd, dst, dst_pos, size, hdc, &origin, key, blend, flags, dirty);
+    SelectObject(hdc, old);
+    DeleteDC(hdc);
+    DeleteObject(copy);
+    if (!logged) {
+        logged = 1;
+        OutputDebugStringA("shfolderproxy: layered window drawn without fully transparent pixels\n");
+    }
+    return ret;
+}
+
+/* Imports of Wine's builtin user32.dll */
+static const struct hook win32u_hooks[] = {
+    { "NtUserUpdateLayeredWindow", (void *)update_layered_hook, (void **)&real_update_layered },
+};
+
 /* ---- Import table patching ---------------------------------------------- */
 
 static BYTE *data_directory(BYTE *base, int index, DWORD *size)
@@ -464,25 +602,26 @@ typedef struct {
     DWORD original_first_thunk, timestamp, forwarder_chain, name, first_thunk;
 } IMPORT_DESCRIPTOR;
 
-/* Called after Wine has resolved the module's imports (see process_attach in ntdll/loader.c). */
-static void patch_bcrypt_imports(BYTE *base)
+/* Points the module's imports of the hooked functions from `dll` at the hooks. Called after
+ * Wine has resolved the module's imports (see process_attach in ntdll/loader.c). */
+static void patch_imports(BYTE *base, const char *dll, const struct hook *hooks, unsigned count)
 {
     DWORD size;
     IMPORT_DESCRIPTOR *desc = (IMPORT_DESCRIPTOR *)data_directory(base, IMAGE_DIRECTORY_ENTRY_IMPORT, &size);
 
     for (; desc && desc->name; desc++) {
         ULONGLONG *names, *slots;
-        if (!desc->original_first_thunk || !streq_ci((const char *)(base + desc->name), "bcrypt.dll")) continue;
+        if (!desc->original_first_thunk || !streq_ci((const char *)(base + desc->name), dll)) continue;
         names = (ULONGLONG *)(base + desc->original_first_thunk);
         slots = (ULONGLONG *)(base + desc->first_thunk);
         for (; *names; names++, slots++) {
             const char *name;
             if (*names & IMAGE_ORDINAL_FLAG64) continue;
             name = (const char *)(base + (DWORD)*names + 2);
-            for (unsigned i = 0; i < sizeof(bcrypt_hooks) / sizeof(bcrypt_hooks[0]); i++) {
-                if (!streq(name, bcrypt_hooks[i].name) || *slots == (ULONGLONG)bcrypt_hooks[i].hook) continue;
-                *bcrypt_hooks[i].real = (void *)*slots;
-                set_slot(slots, bcrypt_hooks[i].hook);
+            for (unsigned i = 0; i < count; i++) {
+                if (!streq(name, hooks[i].name) || *slots == (ULONGLONG)hooks[i].hook) continue;
+                *hooks[i].real = (void *)*slots;
+                set_slot(slots, hooks[i].hook);
             }
         }
     }
@@ -507,7 +646,7 @@ static void dll_loaded(DWORD reason, const DLL_NOTIFICATION_DATA *data, void *co
     patch_user32_delay_imports(data->dll_base);
     if (!data->base_name) return;
     if (wname_is(data->base_name->buffer, data->base_name->length / 2, "simbeor_sdk.dll"))
-        patch_bcrypt_imports(data->dll_base);
+        patch_imports(data->dll_base, "bcrypt.dll", bcrypt_hooks, sizeof(bcrypt_hooks) / sizeof(bcrypt_hooks[0]));
     else if (wname_is(data->base_name->buffer, data->base_name->length / 2, "dwrite.dll"))
         dwrite_loaded(data->dll_base);
 }
@@ -518,6 +657,9 @@ BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
     (void)self; (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         patch_user32_delay_imports(GetModuleHandleW(0));
+        if (is_wine_builtin(GetModuleHandleW(L"user32.dll")))
+            patch_imports(GetModuleHandleW(L"user32.dll"), "win32u.dll", win32u_hooks,
+                          sizeof(win32u_hooks) / sizeof(win32u_hooks[0]));
         LdrRegisterDllNotification(0, (void *)dll_loaded, 0, &cookie);
         if (GetModuleHandleW(L"dwrite.dll")) dwrite_loaded(GetModuleHandleW(L"dwrite.dll"));
     }

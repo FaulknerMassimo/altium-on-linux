@@ -58,6 +58,7 @@ Hyprland rules only matter on Hyprland.
 | 10 | Opening a PCB closes Altium (`GnuTLS error: Decryption has failed`) | `SHFolder.dll` proxy does raw RSA for the Simbeor license check |
 | 11 | PCB and schematic views one frame behind: a click selects, but the highlight shows up only with the next redraw | Vulkan layer waits for each present before Wine copies the view; `dxvk.conf`: `dxgi.syncInterval = 0` |
 | 12 | Schematic text with missing strokes and underscores, slow redraws | `SHFolder.dll` proxy routes Direct2D text through DirectWrite bitmaps |
+| 13 | Black box around part of the splash screen | `SHFolder.dll` proxy keeps Wine from cutting transparent pixels out of layered windows |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.
@@ -156,12 +157,12 @@ In the PCB editor, press **Shift+H** to hide the heads-up display until it is fi
 | Where | What | Fix |
 |---|---|---|
 | `Program Files\Altium\AD26\cmd.exe` | shim: opens `cmd /c start <url>` links directly, passes everything else to the real `cmd.exe` | 6 |
-| `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text | 9, 10, 12 |
+| `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text, layered windows | 9, 10, 12, 13 |
 | `Program Files\Altium\AD26\dxvk.conf` | `dxgi.syncInterval = 0` | 11 |
 | `<bottle>/altium-on-linux/vulkan/` | Vulkan layer (Linux library and manifest) that waits for each present | 11 |
 | `windows\Fonts\segoeui-selawik*.ttf` | Selawik renamed to "Segoe UI", built locally from Microsoft's release | 8 |
 | `HKCU\Software\Wine\DllOverrides` | `tabtip.exe` disabled | 4 |
-| `HKCU\Software\Wine\AppDefaults\X2.EXE\DllOverrides` | `shfolder` = `native,builtin` | 9, 10 |
+| `HKCU\Software\Wine\AppDefaults\X2.EXE\DllOverrides` | `shfolder` = `native,builtin` | 9, 10, 12, 13 |
 | `HKCU\Software\Microsoft\Avalon.Graphics` | WPF software rendering | 4 |
 | `HKCU\Software\Altium\Altium Designer {…}\…\AltiumPortal\Account` | `UnifiedLogin` = `1` | 5 |
 | `HKLM\…\Fonts`, `HKCU\Control Panel\Desktop` | register the fonts, RGB font smoothing | 8 |
@@ -203,7 +204,7 @@ fonts/           rename_to_segoeui.py (Selawik -> "Segoe UI")
 registry/        .reg files imported by install.sh
 scripts/         build, install, debugging tools (lib.sh is shared)
 src/cmdshim/     cmd.exe shim
-src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA, Direct2D text)
+src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA, Direct2D text, layered windows)
 src/presentwait/ Vulkan layer that waits for each present (Linux)
 src/tools/       wininfo.exe, clearex.exe, postmsg.exe (diagnostics)
 tests/           raw RSA test

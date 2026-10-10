@@ -22,6 +22,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 10 | Opening a PCB kills Altium (`GnuTLS error: Decryption has failed`) | Wine's GnuTLS `bcrypt` ignores `BCRYPT_PAD_NONE` | `SHFolder.dll` proxy (raw RSA) |
 | 11 | PCB and schematic views one frame behind (a selection shows up only with the next redraw) | Wine copies an off-screen child window before Mesa's X11 present has updated it | Vulkan layer that waits for each present to complete |
 | 12 | Schematic text with missing strokes, slow schematic redraws | Wine's d2d1 picks the text rendering mode without the zoom transform, fills glyph outlines unantialiased | `SHFolder.dll` proxy (DirectWrite hooks) |
+| 13 | Black box around part of the splash screen | Wine cuts transparent pixels out with an X shape and never paints them; Hyprland ignores X shapes | `SHFolder.dll` proxy (layered windows) |
 
 ## 1. ICU error in the installer
 
@@ -326,3 +327,43 @@ Wine's builtin `d2d1.dll`:
 On a 317 KB sheet, ten scroll steps posted to the view took 3.6 to 4.4 s of UI-thread
 CPU before and 0.8 s after, in fresh sessions (`scripts/redraw-bench.sh` measures this). If `dwrite.dll` or `d2d1.dll` is not Wine's builtin,
 nothing is patched.
+
+## 13. Black box around the splash screen (layered windows and X shapes)
+
+The splash screen had a solid black area to the right of the circuit board, where it
+should be transparent, while the transparent areas above and left of it were fine.
+
+The splash is five windows: an opaque centre (`StartUpWindow`) and four "shadow" windows
+around it (left, right, top and bottom, drawn from `System\edp_splash_*.png`) that
+X2.EXE draws with per-pixel alpha through `UpdateLayeredWindow` (not through its import
+of it: wrapping that import caught nothing). Wine gives layered windows a 32-bit ARGB
+visual, so Hyprland blends their partly transparent pixels correctly. But Wine 11 also
+builds an X shape from the alpha channel: `set_surface_shape` (`dlls/win32u/dce.c`)
+leaves out every pixel with alpha 0, and `x11drv_surface_flush`
+(`dlls/winex11.drv/bitblt.c`) sets that shape before it puts the image, so X clips the
+paint and the cut-out pixels are never written. A compositor that applies X shapes hides
+them. On Hyprland (XWayland) the shape is not applied, and those pixels show whatever
+the window's buffer held: opaque black for the right window and the right half of the
+bottom one, transparent for the others. winex11's `ShapeLayeredWindows` setting is still
+read but no longer used in Wine 11.
+
+Evidence: during start-up, each splash window was captured through X11 (`XGetImage` and
+`XShapeGetRectangles`) and the screen with `grim`. The X contents and shapes were right
+(490, 200 and 126 rectangles for the right, top and bottom windows), and the black area
+on screen was exactly the pixels outside the shapes of the right window and the right
+half of the bottom one. `XGetImage` returns zeros outside a window's shape, so it cannot
+show what the buffer really holds there.
+
+**Fix:** Wine's `user32` passes `UpdateLayeredWindow` and `UpdateLayeredWindowIndirect`
+on to `win32u!NtUserUpdateLayeredWindow` through its import table, which the
+`SHFolder.dll` proxy points at a wrapper when it loads; this catches every caller,
+however it found the function. For per-pixel alpha (`ULW_ALPHA` with `AC_SRC_ALPHA`)
+from a 32-bit DIB section with any pixel of alpha 0, the wrapper passes a copy of the
+source area in which those pixels are black with alpha 1. They stay invisible, the shape
+covers the whole window and Wine paints every pixel. One difference remains: Windows
+lets clicks through pixels of alpha 0, and these pixels now take them. Layered windows
+of other processes (WebView2) are not covered.
+
+With the fix the four shadow windows had a one-rectangle shape, and of the splash's
+70,156 fully transparent pixels all but 230 matched the screen behind it within 3%;
+before, 28,980 of them were pure black.

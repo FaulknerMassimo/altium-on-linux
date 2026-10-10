@@ -46,7 +46,8 @@ link_exe cmd start_entry "$SRC/cmdshim/cmdshim.c" \
 clang "${CFLAGS[@]}" -c "$SRC/shfolderproxy/shfolderproxy.c" -o "$OBJ/shfolderproxy.obj"
 lld-link /nologo /Brepro /dll /entry:DllMain /nodefaultlib /machine:x64 \
     /def:"$SRC/shfolderproxy/shfolder.def" /out:"$OUT/SHFolder.dll" "$OBJ/shfolderproxy.obj" \
-    "$(importlib "$SRC/shfolderproxy/kernel32.def")" "$(importlib "$SRC/shfolderproxy/ntdll.def")"
+    "$(importlib "$SRC/shfolderproxy/kernel32.def")" "$(importlib "$SRC/shfolderproxy/ntdll.def")" \
+    "$(importlib "$SRC/shfolderproxy/gdi32.def")"
 rm -f "$OUT/SHFolder.lib" "$OUT/SHFolder.exp"
 
 link_exe wininfo start_entry "$SRC/tools/wininfo.c" "$SRC/tools/user32.def" "$SRC/tools/kernel32.def"
