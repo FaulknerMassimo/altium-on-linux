@@ -8,3 +8,7 @@ SelectObject
 DeleteDC
 DeleteObject
 GdiFlush
+BitBlt
+PatBlt
+GdiAlphaBlend
+GdiTransparentBlt

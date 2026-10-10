@@ -22,7 +22,7 @@ redistributed here.
 | PCB editor, 2D and 3D | works |
 | Schematic editor | opens and redraws, text fixed ([§12](docs/how-it-works.md#12-schematic-text-broken-and-redraws-slow-direct2d-text)); editing untested |
 | PCB and schematic views showing the previous frame | fixed ([§11](docs/how-it-works.md#11-pcb-and-schematic-views-one-frame-behind-vulkan-present-race)) |
-| Heads-up display in the PCB view | dark box; press Shift+H to hide it |
+| Heads-up display in the PCB view | fixed ([§14](docs/how-it-works.md#14-heads-up-display-frozen-in-the-pcb-view-layered-child-windows)); drawn over black rather than blended with the board |
 | Dragging floating panels across monitors with different scaling | jitters |
 | Loading a project | occasionally freezes (seen twice) |
 
@@ -59,6 +59,7 @@ Hyprland rules only matter on Hyprland.
 | 11 | PCB and schematic views one frame behind: a click selects, but the highlight shows up only with the next redraw | Vulkan layer waits for each present before Wine copies the view; `dxvk.conf`: `dxgi.syncInterval = 0` |
 | 12 | Schematic text with missing strokes and underscores, slow redraws | `SHFolder.dll` proxy routes Direct2D text through DirectWrite bitmaps |
 | 13 | Black box around part of the splash screen | `SHFolder.dll` proxy keeps Wine from cutting transparent pixels out of layered windows |
+| 14 | PCB heads-up display frozen in the view, a live copy in the corner of the screen on every workspace | `SHFolder.dll` proxy draws layered child windows into their parent |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.
@@ -150,19 +151,17 @@ Start Altium from Bottles, open **License Management** and click **Sign In**. Yo
 browser opens Altium's sign-in page; once you are signed in there, Altium picks it up
 and you can use your license.
 
-In the PCB editor, press **Shift+H** to hide the heads-up display until it is fixed.
-
 ## What `install.sh` changes
 
 | Where | What | Fix |
 |---|---|---|
 | `Program Files\Altium\AD26\cmd.exe` | shim: opens `cmd /c start <url>` links directly, passes everything else to the real `cmd.exe` | 6 |
-| `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text, layered windows | 9, 10, 12, 13 |
+| `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text, layered windows | 9, 10, 12, 13, 14 |
 | `Program Files\Altium\AD26\dxvk.conf` | `dxgi.syncInterval = 0` | 11 |
 | `<bottle>/altium-on-linux/vulkan/` | Vulkan layer (Linux library and manifest) that waits for each present | 11 |
 | `windows\Fonts\segoeui-selawik*.ttf` | Selawik renamed to "Segoe UI", built locally from Microsoft's release | 8 |
 | `HKCU\Software\Wine\DllOverrides` | `tabtip.exe` disabled | 4 |
-| `HKCU\Software\Wine\AppDefaults\X2.EXE\DllOverrides` | `shfolder` = `native,builtin` | 9, 10, 12, 13 |
+| `HKCU\Software\Wine\AppDefaults\X2.EXE\DllOverrides` | `shfolder` = `native,builtin` | 9, 10, 12, 13, 14 |
 | `HKCU\Software\Microsoft\Avalon.Graphics` | WPF software rendering | 4 |
 | `HKCU\Software\Altium\Altium Designer {…}\…\AltiumPortal\Account` | `UnifiedLogin` = `1` | 5 |
 | `HKLM\…\Fonts`, `HKCU\Control Panel\Desktop` | register the fonts, RGB font smoothing | 8 |

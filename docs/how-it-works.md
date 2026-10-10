@@ -23,6 +23,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 11 | PCB and schematic views one frame behind (a selection shows up only with the next redraw) | Wine copies an off-screen child window before Mesa's X11 present has updated it | Vulkan layer that waits for each present to complete |
 | 12 | Schematic text with missing strokes, slow schematic redraws | Wine's d2d1 picks the text rendering mode without the zoom transform, fills glyph outlines unantialiased | `SHFolder.dll` proxy (DirectWrite hooks) |
 | 13 | Black box around part of the splash screen | Wine cuts transparent pixels out with an X shape and never paints them; Hyprland ignores X shapes | `SHFolder.dll` proxy (layered windows) |
+| 14 | PCB heads-up display frozen in the view, a live copy in the corner of the screen on every workspace | Wine gives a layered child window its own top-level X window | `SHFolder.dll` proxy (layered child windows) |
 
 ## 1. ICU error in the installer
 
@@ -367,3 +368,51 @@ of other processes (WebView2) are not covered.
 With the fix the four shadow windows had a one-rectangle shape, and of the splash's
 70,156 fully transparent pixels all but 230 matched the screen behind it within 3%;
 before, 28,980 of them were pure black.
+
+## 14. Heads-up display frozen in the PCB view (layered child windows)
+
+The heads-up display (the box at the top left of the PCB view with the cursor
+coordinates, layer, snap and the object under the cursor) did not update: its place in the
+view showed an old copy of it, or of the board, while a live copy sat in the top-left
+corner of the screen, on top of every window and on every workspace.
+
+The HUD (`TForm_HeadsUpTranslucent`) is a layered child window (`WS_EX_LAYERED`, which
+Windows allows for child windows since Windows 8) of the Direct3D view `View_Graphical`,
+drawn with `UpdateLayeredWindow` and per-pixel alpha. In Wine 11,
+`NtUserUpdateLayeredWindow` asks for a layered window surface (`get_window_surface` with
+`create_layered`, `dlls/win32u/window.c`), and winex11's `X11DRV_CreateWindowSurface`
+switches the window to the ARGB visual (`set_window_visual`), which destroys and recreates
+its "whole window": `create_whole_window` (`dlls/winex11.drv/window.c`) always creates it on
+the root window. A child window has no whole window otherwise, and is drawn into its
+top-level window's surface. So the HUD became an override-redirect top-level X window at its
+parent-relative position (0,0 on the screen), and Hyprland showed it above everything. In
+the view, nothing drew the HUD's rectangle any more: Wine copies the Direct3D frames into the
+main window clipped to the view's visible region, from which wineserver's `clip_children`
+removes every visible child (`View_Graphical` has `WS_CLIPCHILDREN`), so the rectangle kept
+whatever was last drawn there.
+
+Evidence: `scripts/wininfo.sh` listed the HUD as a visible child of `View_Graphical`;
+`xprop` on the extra X window showed the HUD's title and its Win32 styles
+(`_WINE_HWND_STYLE` 0x56000000, a child) and XGetImage showed it override-redirect, 32-bit,
+with the live HUD in it (background alpha 217). The main window's capture showed an older
+HUD (different coordinates) at the HUD's place.
+
+**Fix:** the `SHFolder.dll` proxy's `NtUserUpdateLayeredWindow` wrapper (§13) handles
+child windows itself and does not call Wine: it applies the position and size, keeps the
+image composited over black in a bitmap, and draws it into the window, which paints into the
+main window like any child. A subclassed window procedure draws the bitmap again after
+`WM_PAINT` (which Wine sends and Windows does not; VCL would fill the window with the form's
+colour), stops `WM_ERASEBKGND`, and on hide, move or resize has the view repaint the area the
+HUD left (wineserver repaints nothing for these windows, `set_window_pos` adds
+`SWP_NOREDRAW`), so Altium renders the board there again.
+
+Windows blends the HUD over the board; here it is drawn over black, because the view is
+drawn on the X server and cannot be read back. The HUD is a dark box at 85% opacity, so over
+the default dark background the difference is a few levels of grey; over lighter objects the
+box is darker than on Windows. Layered windows that are not children (the splash) still go
+through Wine.
+
+The proxy looks up the `user32` functions it needs at run time instead of importing them: a
+build that imported `user32.dll` lost a thread's wineserver connection in both test runs
+(see [known-issues.md](known-issues.md#lost-connection-to-wineserver)).
+

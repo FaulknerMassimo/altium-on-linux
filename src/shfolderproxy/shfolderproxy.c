@@ -3,7 +3,7 @@
  *
  * X2.EXE imports SHFolder.dll at startup, so a copy of this DLL placed next to
  * X2.EXE is loaded early. Its exports forward to shell32 like Wine's own
- * shfolder. On load it works around four Wine gaps, in X2.EXE and in every DLL
+ * shfolder. On load it works around five Wine gaps, in X2.EXE and in every DLL
  * loaded later (via LdrRegisterDllNotification):
  *
  * 1. Missing user32 functions. Altium delay-loads a few newer user32 functions
@@ -45,6 +45,17 @@
  *    UpdateLayeredWindow); that import of user32 is wrapped and gets a copy of
  *    the bitmap in which alpha-0 pixels have alpha 1 (invisible), so Wine
  *    paints every pixel.
+ *
+ * 5. Layered child windows (the PCB editor's heads-up display). Windows 8 and
+ *    later let a child window be layered; the HUD is one, inside the Direct3D
+ *    PCB view. For UpdateLayeredWindow on a child, Wine 11 switches the window
+ *    to an ARGB visual, which gives it its own top-level X window at its
+ *    parent-relative position: the HUD shows in the corner of the screen, on
+ *    every workspace, while its place in the view (clipped out of the view's
+ *    Direct3D frames) keeps whatever was last drawn there. For a child, the
+ *    same wrapper does not call Wine: it keeps the image composited over black
+ *    and draws it into the window, which paints into the main window like any
+ *    child, and redraws it whenever the window is repainted, moved or shown.
  *
  * Build: scripts/build.sh (clang + lld-link + llvm-dlltool; no Windows SDK or CRT needed).
  */
@@ -438,6 +449,7 @@ typedef void *HDC;
 typedef void *HGDIOBJ;
 typedef struct { int x, y; } POINT;
 typedef struct { int cx, cy; } SIZE;
+typedef struct { int left, top, right, bottom; } RECT;
 typedef struct { BYTE op, flags, constant_alpha, format; } BLENDFUNCTION;
 typedef struct {
     DWORD size;
@@ -476,7 +488,7 @@ IMPORT BOOL GdiFlush(void);
 /* win32u's NtUserUpdateLayeredWindow: UpdateLayeredWindow plus a dirty rectangle */
 typedef BOOL (*update_layered_fn)(HWND hwnd, HDC dst, const POINT *dst_pos, const SIZE *size, HDC src,
                                   const POINT *src_pos, DWORD key, const BLENDFUNCTION *blend, DWORD flags,
-                                  const void *dirty);
+                                  const RECT *dirty);
 
 static update_layered_fn real_update_layered;
 
@@ -524,16 +536,306 @@ static HGDIOBJ copy_without_transparent_pixels(HDC src, const POINT *src_pos, co
     return copy;
 }
 
+/* ---- 5. Layered child windows ------------------------------------------- */
+
+typedef long long LONG_PTR;
+typedef unsigned long long WPARAM;
+typedef long long LPARAM;
+typedef long long LRESULT;
+typedef LRESULT (*WNDPROC)(HWND hwnd, unsigned msg, WPARAM wp, LPARAM lp);
+
+/* user32 is resolved at run time (user32_ready) rather than imported: in testing, both runs of
+ * a build that imported it lost a thread's wineserver connection and then hung on exit, and
+ * the runs without the import did not (docs/known-issues.md). Called through these pointers
+ * under their usual names. */
+static LONG_PTR (*GetWindowLongPtrW)(HWND hwnd, int index);
+static LONG_PTR (*SetWindowLongPtrW)(HWND hwnd, int index, LONG_PTR value);
+static LRESULT (*CallWindowProcW)(WNDPROC proc, HWND hwnd, unsigned msg, WPARAM wp, LPARAM lp);
+static BOOL (*GetLayeredWindowAttributes)(HWND hwnd, DWORD *key, BYTE *alpha, DWORD *flags);
+static HWND (*GetAncestor)(HWND hwnd, unsigned flags);
+static BOOL (*GetWindowRect)(HWND hwnd, RECT *rect);
+static int (*MapWindowPoints)(HWND from, HWND to, POINT *points, unsigned count);
+static BOOL (*SetWindowPos)(HWND hwnd, HWND after, int x, int y, int cx, int cy, unsigned flags);
+static BOOL (*IsWindowVisible)(HWND hwnd);
+static BOOL (*RedrawWindow)(HWND hwnd, const RECT *rect, void *region, unsigned flags);
+static HDC (*GetWindowDC)(HWND hwnd);
+static int (*ReleaseDC)(HWND hwnd, HDC hdc);
+
+static int user32_ready(void)
+{
+    static const struct { const char *name; void **fn; } fns[] = {
+        { "GetWindowLongPtrW", (void **)&GetWindowLongPtrW },
+        { "SetWindowLongPtrW", (void **)&SetWindowLongPtrW },
+        { "CallWindowProcW", (void **)&CallWindowProcW },
+        { "GetLayeredWindowAttributes", (void **)&GetLayeredWindowAttributes },
+        { "GetAncestor", (void **)&GetAncestor },
+        { "GetWindowRect", (void **)&GetWindowRect },
+        { "MapWindowPoints", (void **)&MapWindowPoints },
+        { "SetWindowPos", (void **)&SetWindowPos },
+        { "IsWindowVisible", (void **)&IsWindowVisible },
+        { "RedrawWindow", (void **)&RedrawWindow },
+        { "GetWindowDC", (void **)&GetWindowDC },
+        { "ReleaseDC", (void **)&ReleaseDC },
+    };
+    static volatile int ready = -1;
+    HMODULE user32;
+    int ok;
+
+    if (ready >= 0) return ready;
+    ok = !!(user32 = GetModuleHandleW(L"user32.dll"));
+    for (unsigned i = 0; ok && i < sizeof(fns) / sizeof(fns[0]); i++) ok = !!(*fns[i].fn = GetProcAddress(user32, fns[i].name));
+    return ready = ok;
+}
+
+IMPORT BOOL BitBlt(HDC dst, int x, int y, int cx, int cy, HDC src, int sx, int sy, DWORD rop);
+IMPORT BOOL PatBlt(HDC hdc, int x, int y, int cx, int cy, DWORD rop);
+IMPORT BOOL GdiAlphaBlend(HDC dst, int x, int y, int cx, int cy, HDC src, int sx, int sy, int scx, int scy,
+                          BLENDFUNCTION blend);
+IMPORT BOOL GdiTransparentBlt(HDC dst, int x, int y, int cx, int cy, HDC src, int sx, int sy, int scx, int scy,
+                              DWORD key);
+
+#define GWLP_WNDPROC (-4)
+#define GWL_STYLE (-16)
+#define GWL_EXSTYLE (-20)
+#define WS_CHILD 0x40000000
+#define WS_EX_LAYERED 0x00080000
+#define GA_PARENT 1
+#define ULW_COLORKEY 1
+#define ULW_OPAQUE 4
+#define ULW_EX_NORESIZE 8
+#define SWP_NOSIZE 0x01
+#define SWP_NOMOVE 0x02
+#define SWP_NOZORDER 0x04
+#define SWP_NOACTIVATE 0x10
+#define SWP_SHOWWINDOW 0x40
+#define SWP_HIDEWINDOW 0x80
+#define RDW_INVALIDATE 0x01
+#define WM_PAINT 0x0f
+#define WM_ERASEBKGND 0x14
+#define WM_WINDOWPOSCHANGED 0x47
+#define WM_NCDESTROY 0x82
+#define SRCCOPY 0x00cc0020
+#define BLACKNESS 0x00000042
+#define ERROR_INVALID_PARAMETER 87
+#define ERROR_INCORRECT_SIZE 1462
+
+typedef struct { HWND hwnd, after; int x, y, cx, cy; unsigned flags; } WINDOWPOS;
+
+/* What a layered child shows: its last UpdateLayeredWindow image, over black. Windows
+ * composites it over its parent; here the parent is a Direct3D view that is drawn on the X
+ * server and cannot be read back, and the HUD is mostly opaque (alpha 217) and dark, so
+ * black is close to what Windows shows over the PCB's dark background. */
+struct layered_child {
+    HWND hwnd;
+    HGDIOBJ bitmap; /* 32-bit DIB section, width x height */
+    int width, height;
+    WNDPROC old_proc;
+    HWND shown_parent; /* where it was last drawn, in that parent's client coordinates */
+    RECT shown;
+};
+
+#define LAYERED_CHILDREN_MAX 16
+static struct layered_child layered_children[LAYERED_CHILDREN_MAX];
+static volatile long layered_children_lock;
+
+/* The entry for hwnd; with create, a free one if it has none (0 if full). */
+static struct layered_child *find_layered_child(HWND hwnd, int create)
+{
+    struct layered_child *found = 0, *unused = 0;
+    while (__sync_lock_test_and_set(&layered_children_lock, 1)) ;
+    for (int i = 0; i < LAYERED_CHILDREN_MAX && !found; i++) {
+        if (layered_children[i].hwnd == hwnd) found = &layered_children[i];
+        else if (!layered_children[i].hwnd && !unused) unused = &layered_children[i];
+    }
+    if (!found && create && unused) {
+        unused->hwnd = hwnd;
+        found = unused;
+    }
+    __sync_lock_release(&layered_children_lock);
+    return found;
+}
+
+/* The window rectangle in its parent's client coordinates. */
+static BOOL child_rect(HWND hwnd, HWND parent, RECT *rect)
+{
+    if (!GetWindowRect(hwnd, rect)) return 0;
+    MapWindowPoints(0, parent, (POINT *)rect, 2);
+    return 1;
+}
+
+/* The parent clips its children out of what it draws, so where the child no longer is, the
+ * parent shows whatever was drawn there last (the parent is not repainted for these windows):
+ * have it repaint the area the child was last drawn in, unless the child is still there. */
+static void uncover_layered_child(struct layered_child *child)
+{
+    RECT now;
+
+    if (!child->shown_parent) return;
+    if (IsWindowVisible(child->hwnd) && GetAncestor(child->hwnd, GA_PARENT) == child->shown_parent
+            && child_rect(child->hwnd, child->shown_parent, &now) && now.left == child->shown.left
+            && now.top == child->shown.top && now.right == child->shown.right && now.bottom == child->shown.bottom)
+        return;
+    RedrawWindow(child->shown_parent, &child->shown, 0, RDW_INVALIDATE);
+    child->shown_parent = 0;
+}
+
+static void draw_layered_child(struct layered_child *child)
+{
+    HWND parent = GetAncestor(child->hwnd, GA_PARENT);
+    HDC hdc, mem;
+    HGDIOBJ old;
+
+    uncover_layered_child(child);
+    if (!child->bitmap || !IsWindowVisible(child->hwnd) || !(hdc = GetWindowDC(child->hwnd))) return;
+    if ((mem = CreateCompatibleDC(hdc))) {
+        old = SelectObject(mem, child->bitmap);
+        BitBlt(hdc, 0, 0, child->width, child->height, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteDC(mem);
+    }
+    ReleaseDC(child->hwnd, hdc);
+    if (child_rect(child->hwnd, parent, &child->shown)) child->shown_parent = parent;
+}
+
+/* Windows does not send WM_PAINT to a window drawn with UpdateLayeredWindow; Wine does when the
+ * window is invalidated, and VCL then fills it with the form's colour. Let the form paint, then
+ * draw the image again. Hiding, moving and resizing these windows repaints nothing, neither the
+ * window nor its parent. */
+static LRESULT layered_child_proc(HWND hwnd, unsigned msg, WPARAM wp, LPARAM lp)
+{
+    struct layered_child *child = find_layered_child(hwnd, 0);
+    WNDPROC old_proc;
+    LRESULT ret;
+
+    if (!child) return 0; /* not reached: the entry lives until WM_NCDESTROY */
+    old_proc = child->old_proc;
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        ret = CallWindowProcW(old_proc, hwnd, msg, wp, lp);
+        draw_layered_child(child);
+        return ret;
+    case WM_WINDOWPOSCHANGED:
+        ret = CallWindowProcW(old_proc, hwnd, msg, wp, lp);
+        if (((const WINDOWPOS *)lp)->flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)
+                || (~((const WINDOWPOS *)lp)->flags & (SWP_NOMOVE | SWP_NOSIZE)))
+            draw_layered_child(child);
+        return ret;
+    case WM_NCDESTROY:
+        uncover_layered_child(child);
+        if (GetWindowLongPtrW(hwnd, GWLP_WNDPROC) == (LONG_PTR)layered_child_proc)
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)old_proc);
+        if (child->bitmap) DeleteObject(child->bitmap);
+        child->bitmap = 0;
+        child->hwnd = 0;
+        return CallWindowProcW(old_proc, hwnd, msg, wp, lp);
+    }
+    return CallWindowProcW(old_proc, hwnd, msg, wp, lp);
+}
+
+/* Composites the source over black into the child's image (within dirty, if given). */
+static void compose_layered_child(struct layered_child *child, HDC src, const POINT *src_pos, DWORD key,
+                                  const BLENDFUNCTION *blend, DWORD flags, const RECT *dirty)
+{
+    RECT r = { 0, 0, child->width, child->height };
+    int sx = src_pos ? src_pos->x : 0, sy = src_pos ? src_pos->y : 0, cx, cy;
+    HGDIOBJ old;
+    HDC mem;
+
+    if (dirty) {
+        if (dirty->left > r.left) r.left = dirty->left;
+        if (dirty->top > r.top) r.top = dirty->top;
+        if (dirty->right < r.right) r.right = dirty->right;
+        if (dirty->bottom < r.bottom) r.bottom = dirty->bottom;
+    }
+    if ((cx = r.right - r.left) <= 0 || (cy = r.bottom - r.top) <= 0 || !(mem = CreateCompatibleDC(src))) return;
+    old = SelectObject(mem, child->bitmap);
+    PatBlt(mem, r.left, r.top, cx, cy, BLACKNESS);
+    if ((flags & ULW_ALPHA) && blend)
+        GdiAlphaBlend(mem, r.left, r.top, cx, cy, src, sx + r.left, sy + r.top, cx, cy, *blend);
+    else if (flags & ULW_COLORKEY)
+        GdiTransparentBlt(mem, r.left, r.top, cx, cy, src, sx + r.left, sy + r.top, cx, cy, key);
+    else
+        BitBlt(mem, r.left, r.top, cx, cy, src, sx + r.left, sy + r.top, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteDC(mem);
+}
+
+/* UpdateLayeredWindow for a child window: what win32u does (position, size, image), but drawn
+ * into the window instead of a layered surface. Returns -1 to leave the call to Wine. */
+static int update_layered_child(HWND hwnd, const POINT *dst_pos, const SIZE *size, HDC src,
+                                const POINT *src_pos, DWORD key, const BLENDFUNCTION *blend, DWORD flags,
+                                const RECT *dirty)
+{
+    BITMAPINFOHEADER header = { .size = sizeof(header), .planes = 1, .bit_count = 32, .compression = BI_RGB };
+    struct layered_child *child;
+    unsigned swp = SWP_NOZORDER | SWP_NOACTIVATE;
+    int width, height;
+    static int logged;
+    void *bits;
+    RECT rect;
+
+    if (!user32_ready() || !(GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CHILD)
+            || !(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED)
+            || (flags & ~(ULW_COLORKEY | ULW_ALPHA | ULW_OPAQUE | ULW_EX_NORESIZE))
+            || GetLayeredWindowAttributes(hwnd, 0, 0, 0) /* uses SetLayeredWindowAttributes: Wine fails it */
+            || !child_rect(hwnd, GetAncestor(hwnd, GA_PARENT), &rect))
+        return -1;
+    width = size ? size->cx : rect.right - rect.left;
+    height = size ? size->cy : rect.bottom - rect.top;
+    if (width <= 0 || height <= 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if ((flags & ULW_EX_NORESIZE) && (width != rect.right - rect.left || height != rect.bottom - rect.top)) {
+        SetLastError(ERROR_INCORRECT_SIZE);
+        return 0;
+    }
+    if (!(child = find_layered_child(hwnd, 1))) return -1;
+
+    if (!child->old_proc) {
+        child->old_proc = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)layered_child_proc);
+    }
+    if (!child->bitmap || child->width != width || child->height != height) {
+        header.width = width;
+        header.height = -height;
+        if (child->bitmap) DeleteObject(child->bitmap);
+        child->bitmap = CreateDIBSection(0, &header, DIB_RGB_COLORS, &bits, 0, 0); /* zeroed: black */
+        child->width = width;
+        child->height = height;
+    }
+    if (src && child->bitmap) compose_layered_child(child, src, src_pos, key, blend, flags, dirty);
+
+    if (!dst_pos || (dst_pos->x == rect.left && dst_pos->y == rect.top)) swp |= SWP_NOMOVE;
+    if (width == rect.right - rect.left && height == rect.bottom - rect.top) swp |= SWP_NOSIZE;
+    if ((swp & (SWP_NOMOVE | SWP_NOSIZE)) != (SWP_NOMOVE | SWP_NOSIZE))
+        SetWindowPos(hwnd, 0, dst_pos ? dst_pos->x : rect.left, dst_pos ? dst_pos->y : rect.top, width, height, swp);
+    draw_layered_child(child);
+    if (!logged) {
+        logged = 1;
+        OutputDebugStringA("shfolderproxy: layered child window drawn into its parent\n");
+    }
+    return 1;
+}
+
+/* ---- The UpdateLayeredWindow hook (4 and 5) ------------------------------ */
+
 static BOOL update_layered_hook(HWND hwnd, HDC dst, const POINT *dst_pos, const SIZE *size, HDC src,
                                 const POINT *src_pos, DWORD key, const BLENDFUNCTION *blend, DWORD flags,
-                                const void *dirty)
+                                const RECT *dirty)
 {
     static const POINT origin = { 0, 0 };
     static int logged;
-    HGDIOBJ copy = copy_without_transparent_pixels(src, src_pos, size, blend, flags), old;
-    HDC hdc = copy ? CreateCompatibleDC(src) : 0;
+    int child = update_layered_child(hwnd, dst_pos, size, src, src_pos, key, blend, flags, dirty);
+    HGDIOBJ copy, old;
+    HDC hdc;
     BOOL ret;
 
+    if (child >= 0) return child;
+    copy = copy_without_transparent_pixels(src, src_pos, size, blend, flags);
+    hdc = copy ? CreateCompatibleDC(src) : 0;
     if (!hdc) {
         if (copy) DeleteObject(copy);
         return real_update_layered(hwnd, dst, dst_pos, size, src, src_pos, key, blend, flags, dirty);

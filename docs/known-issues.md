@@ -3,23 +3,6 @@
 What still goes wrong, what is known about each problem, and where to dig next.
 Contributions welcome: [debugging.md](debugging.md) has the tools.
 
-## Heads-up display is a dark box
-
-The heads-up display (the translucent box at the top-left of the PCB view with
-coordinates, layer, snap and violations) shows as an empty dark rectangle.
-
-- Wine reports the window (`TForm_HeadsUpTranslucent`) at the right place, as a
-  layered child (`WS_EX_LAYERED`) of the D3D view `View_Graphical`
-  (`scripts/wininfo.sh`).
-- Hyprland lists a separate window with that title, parked off-screen (at -960,0 and
-  later 0,0). It looks like the off-screen X window Wine creates for a child that is
-  drawn with DirectX, managed by the compositor as a normal top-level instead of being
-  composited back into the view.
-- Clearing `WS_EX_LAYERED` at runtime (`build/clearex.exe`) did not change anything.
-
-**Workaround:** press Shift+H in the PCB editor to turn the heads-up display off. The
-same information is in the status bar.
-
 ## Panels jitter when dragged across monitors (mixed scaling)
 
 Dragging a floating panel, especially between monitors, makes it jump back and forth;
@@ -36,12 +19,11 @@ and monitors with different scales, X11 and Hyprland disagree about coordinates.
 | X11 (`xrandr --listmonitors`) | 2880x1800 at x=0 | starts at x=2880 |
 | Hyprland (logical) | 1920x1200 at x=0 | starts at x=1920 |
 
-Windows that Altium positions itself (panels while dragging, the heads-up display)
-land 960 px off, Altium corrects, and the two keep fighting. Toggling
-`force_zero_scaling` with `hyprctl eval` did not update XWayland's layout until a
-restart, so this is untested. Things to try: put the external monitor at x=0 (then its
-X11 and logical coordinates match), or turn `force_zero_scaling` off and accept blurrier
-X11 apps on the laptop screen.
+Windows that Altium positions itself (panels while dragging) land 960 px off, Altium
+corrects, and the two keep fighting. Toggling `force_zero_scaling` with `hyprctl eval` did
+not update XWayland's layout until a restart, so this is untested. Things to try: put the
+external monitor at x=0 (then its X11 and logical coordinates match), or turn
+`force_zero_scaling` off and accept blurrier X11 apps on the laptop screen.
 
 ## `Control 'View…' has no parent window`
 
@@ -106,10 +88,26 @@ project used schematic harness files (`.Harness`). Next step: catch it again wit
 
 ## Lost connection to wineserver
 
-Seen once: the log shows `wine client error: write: Bad file descriptor` right after the
-simulation modules (`SimModel.dll`) loaded and DXVK unloaded Proton's stand-in Intel
-driver (`igd10iumd64.dll`); Altium then hung on the loader lock and exited 20 minutes
-later. Cause unknown.
+The log shows `wine client error:<thread id>: write: Bad file descriptor` (or `read:`): the
+pipe between a thread and wineserver was closed under it, and that thread dies. Altium then
+hangs, at the latest when it is closed: the main window stays up after `WM_CLOSE`, and
+threads wait for the loader lock and for an Altium critical section
+(`RtlpWaitForCriticalSection ... wait timed out`).
+
+- First seen right after the simulation modules (`SimModel.dll`) loaded and DXVK unloaded
+  Proton's stand-in Intel driver (`igd10iumd64.dll`); Altium exited 20 minutes later.
+- Seen three times in both runs of a test build of `SHFolder.dll` that imported
+  `user32.dll` (for the heads-up display fix, [how-it-works §14](how-it-works.md#14-heads-up-display-frozen-in-the-pcb-view-layered-child-windows)):
+  14 s after start, right after the PCB view's swapchain was created and before the HUD was
+  first drawn, and twice about two minutes in, a second or so after a burst of Altium
+  worker threads exited. Both runs hung on close. A run of the previous proxy (3.5 minutes)
+  and a 12-minute run of the released fix, which looks `user32` up at run time, did not show
+  it, and neither did the 18 runs logged before. How an import could close another thread's
+  file descriptor is not known; this may be chance.
+
+Next step: build the proxy with `user32.dll` imported again, start Altium with
+`scripts/debug-launch.sh`, attach `strace -f -e trace=close,dup2,dup3` to X2.EXE and wait two
+minutes, to see which code closes the pipe.
 
 ## Installer sign-in opens no browser
 

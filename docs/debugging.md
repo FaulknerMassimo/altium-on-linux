@@ -172,7 +172,9 @@ not resize Altium's main window from the compositor in tests (`hyprctl dispatch
 resizewindowpixel`): twice in a row raised `Control 'View…' has no parent window`.
 
 Posted mouse clicks (`WM_LBUTTONDOWN`/`WM_LBUTTONUP`) on the schematic view do not select
-anything; Altium seems to check the real button state. The main window's handle changes
+anything; Altium seems to check the real button state. Posted `WM_MOUSEMOVE`s do not update
+the PCB heads-up display either (it follows the real cursor), and `wininfo.sh` lists only
+visible windows, so a hidden HUD is missing from it. The main window's handle changes
 from run to run: look it up with `wininfo.sh` (`cls=TDocumentForm`) before sending
 `WM_CLOSE`. After Altium exits, its WebView2 processes can keep the bottle's wineserver
 running, and `debug-launch.sh` refuses to start until they are gone; once `X2.EXE` has
