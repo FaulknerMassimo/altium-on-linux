@@ -22,6 +22,18 @@
  *    decryption with a remembered private key is done here (rsa_raw.c), every
  *    other call goes straight to Wine's bcrypt.
  *
+ * 3. Schematic text through Wine's Direct2D. The schematic editor draws with
+ *    Direct2D and builds its text in "world" units (a 10 pt label has an em size
+ *    of ~900) that a zoom transform scales down. Wine's d2d1 picks the rendering
+ *    mode from the untransformed em size, gets OUTLINE (>= 100) and fills every
+ *    glyph outline as geometry, which Wine draws without antialiasing (strokes
+ *    and underscores vanish) and triangulates on the CPU every frame. Once Wine's
+ *    builtin dwrite.dll is loaded, two of its vtable slots are wrapped, for calls
+ *    coming from Wine's builtin d2d1.dll only: GetRecommendedRenderingMode turns
+ *    OUTLINE into NATURAL_SYMMETRIC (antialiased bitmaps), and
+ *    CreateGlyphRunAnalysis folds a uniform scale into the em size, advances and
+ *    origin, because dwrite bypasses its glyph cache for any transform.
+ *
  * Build: scripts/build.sh (clang + lld-link + llvm-dlltool; no Windows SDK or CRT needed).
  */
 
@@ -42,6 +54,7 @@ IMPORT void *GetProcAddress(HMODULE module, const char *name);
 IMPORT BOOL VirtualProtect(void *addr, SIZE_T size, DWORD prot, DWORD *old);
 IMPORT void SetLastError(DWORD err);
 IMPORT void OutputDebugStringA(const char *msg);
+IMPORT HANDLE CreateThread(void *attrs, SIZE_T stack, DWORD (*start)(void *), void *arg, DWORD flags, DWORD *tid);
 IMPORT NTSTATUS LdrRegisterDllNotification(DWORD flags, void *callback, void *context, void **cookie);
 
 #define PAGE_READWRITE 0x04
@@ -227,6 +240,183 @@ static const struct { const char *name; void *hook; void **real; } bcrypt_hooks[
     { "BCryptDestroyKey", (void *)destroy_key_hook, (void **)&real_destroy_key },
 };
 
+/* ---- 3. Direct2D text in the schematic editor -------------------------- */
+
+typedef long HRESULT;
+typedef struct { DWORD d1; WORD d2, d3; BYTE d4[8]; } GUID;
+typedef struct { float m11, m12, m21, m22, dx, dy; } DWRITE_MATRIX;
+typedef struct { float advance_offset, ascender_offset; } DWRITE_GLYPH_OFFSET;
+typedef struct {
+    void *font_face;
+    float em_size;
+    DWORD count;
+    const WORD *indices;
+    const float *advances;
+    const DWRITE_GLYPH_OFFSET *offsets;
+    BOOL sideways;
+    DWORD bidi_level;
+} DWRITE_GLYPH_RUN;
+
+int _fltused; /* float code without a CRT */
+
+#define DWRITE_MEASURING_MODE_NATURAL 0
+#define DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC 5
+#define DWRITE_RENDERING_MODE_OUTLINE 6
+#define GLYPHS_MAX 256 /* longer runs keep their transform (stack arrays below stay under a page) */
+
+/* COM vtable slots (fixed by the interfaces, the same in every Wine version) */
+#define SLOT_RELEASE 2
+#define SLOT_FACTORY_GET_SYSTEM_FONT_COLLECTION 3
+#define SLOT_FACTORY2_CREATE_GLYPH_RUN_ANALYSIS 30
+#define SLOT_COLLECTION_GET_FONT_FAMILY 4
+#define SLOT_FAMILY_GET_FONT 5
+#define SLOT_FONT_CREATE_FONT_FACE 13
+#define SLOT_FONT_FACE_GET_RECOMMENDED_RENDERING_MODE 15
+
+static const GUID IID_IDWriteFactory2 = { 0x0439fc60, 0xca44, 0x4994, { 0x8d, 0xee, 0x3a, 0x9a, 0xf7, 0xb7, 0x32, 0xec } };
+
+typedef HRESULT (*recommend_fn)(void *face, float em_size, float pixels_per_dip, int measuring_mode,
+                                void *params, int *mode);
+typedef HRESULT (*analysis_fn)(void *factory, const DWRITE_GLYPH_RUN *run, const DWRITE_MATRIX *m,
+                               int rendering_mode, int measuring_mode, int grid_fit_mode, int aa_mode,
+                               float x, float y, void **analysis);
+
+static recommend_fn real_recommend;
+static analysis_fn real_analysis;
+
+/* Wine marks its own PE DLLs with this string after the DOS header. */
+static int is_wine_builtin(const BYTE *base)
+{
+    static const char sig[] = "Wine builtin DLL";
+    if (!base || base[0] != 'M' || base[1] != 'Z') return 0;
+    for (unsigned i = 0; i < sizeof(sig) - 1; i++)
+        if (base[0x40 + i] != (BYTE)sig[i]) return 0;
+    return 1;
+}
+
+static DWORD image_size(const BYTE *base)
+{
+    return *(const DWORD *)(base + *(const DWORD *)(base + 0x3c) + 0x50); /* SizeOfImage */
+}
+
+static int in_image(const BYTE *base, const void *addr)
+{
+    return base && (const BYTE *)addr >= base && (const BYTE *)addr < base + image_size(base);
+}
+
+/* Only Wine's d2d1 makes the em-size mistake; leave every other caller alone. */
+static int from_wine_d2d1(const void *return_address)
+{
+    static const BYTE *d2d1;
+    if (!d2d1) {
+        const BYTE *base = GetModuleHandleW(L"d2d1.dll");
+        if (!is_wine_builtin(base)) return 0;
+        d2d1 = base;
+    }
+    return in_image(d2d1, return_address);
+}
+
+static HRESULT recommend_hook(void *face, float em_size, float pixels_per_dip, int measuring_mode,
+                              void *params, int *mode)
+{
+    HRESULT hr = real_recommend(face, em_size, pixels_per_dip, measuring_mode, params, mode);
+    if (hr >= 0 && *mode == DWRITE_RENDERING_MODE_OUTLINE && from_wine_d2d1(__builtin_return_address(0)))
+        *mode = DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC;
+    return hr;
+}
+
+/* A run drawn through m = scale s plus translation lands on the same pixels as the run with
+ * em size, advances and offsets times s, the origin mapped through m, and no transform
+ * (glyphs are then hinted at their on-screen size). With GDI measuring modes dwrite rounds
+ * default advances through the transform, so only NATURAL runs are folded. */
+static HRESULT analysis_hook(void *factory, const DWRITE_GLYPH_RUN *run, const DWRITE_MATRIX *m,
+                             int rendering_mode, int measuring_mode, int grid_fit_mode, int aa_mode,
+                             float x, float y, void **analysis)
+{
+    float advances[GLYPHS_MAX];
+    DWRITE_GLYPH_OFFSET offsets[GLYPHS_MAX];
+    DWRITE_GLYPH_RUN scaled;
+    float s;
+
+    if (!m || !run || !run->count || run->count > GLYPHS_MAX || measuring_mode != DWRITE_MEASURING_MODE_NATURAL
+            || m->m12 != 0.0f || m->m21 != 0.0f
+            || m->m11 != m->m22 || m->m11 <= 0.0f || m->m11 == 1.0f || !from_wine_d2d1(__builtin_return_address(0)))
+        return real_analysis(factory, run, m, rendering_mode, measuring_mode, grid_fit_mode, aa_mode, x, y, analysis);
+
+    s = m->m11;
+    scaled = *run;
+    scaled.em_size = run->em_size * s;
+    if (run->advances) {
+        for (DWORD i = 0; i < run->count; i++) advances[i] = run->advances[i] * s;
+        scaled.advances = advances;
+    }
+    if (run->offsets) {
+        for (DWORD i = 0; i < run->count; i++) {
+            offsets[i].advance_offset = run->offsets[i].advance_offset * s;
+            offsets[i].ascender_offset = run->offsets[i].ascender_offset * s;
+        }
+        scaled.offsets = offsets;
+    }
+    /* dwrite reads advances and offsets only while it creates the analysis */
+    return real_analysis(factory, &scaled, 0, rendering_mode, measuring_mode, grid_fit_mode, aa_mode,
+                         x * s + m->dx, y * s + m->dy, analysis);
+}
+
+#define VTBL(obj) (*(void ***)(obj))
+typedef HRESULT (*create_factory_fn)(int type, const GUID *iid, void **factory);
+typedef HRESULT (*get_collection_fn)(void *factory, void **collection, BOOL check_updates);
+typedef HRESULT (*get_indexed_fn)(void *obj, DWORD index, void **out);
+typedef HRESULT (*create_face_fn)(void *font, void **face);
+typedef DWORD (*release_fn)(void *obj);
+
+static void release(void *obj)
+{
+    if (obj) ((release_fn)VTBL(obj)[SLOT_RELEASE])(obj);
+}
+
+static void wrap_slot(const BYTE *dwrite, void **slot, void *hook, void **real)
+{
+    if (*slot == hook || !in_image(dwrite, *slot)) return; /* already wrapped, or not Wine's layout */
+    *real = *slot;
+    __sync_synchronize(); /* the real pointer is visible before the slot changes */
+    set_slot((ULONGLONG *)slot, hook);
+}
+
+/* Runs on its own thread: dwrite cannot be used from the load notification (loader lock,
+ * and its DllMain has not run yet); the thread starts once the load has finished. */
+static DWORD patch_dwrite(void *module)
+{
+    const BYTE *dwrite = module;
+    create_factory_fn create = (create_factory_fn)GetProcAddress(module, "DWriteCreateFactory");
+    void *factory = 0, *collection = 0, *family = 0, *font = 0, *face = 0;
+
+    if (!create || create(0 /* SHARED */, &IID_IDWriteFactory2, &factory) < 0) return 1;
+    wrap_slot(dwrite, &VTBL(factory)[SLOT_FACTORY2_CREATE_GLYPH_RUN_ANALYSIS], (void *)analysis_hook, (void **)&real_analysis);
+
+    /* The font-face vtable is shared by every font face; any face gives access to it. */
+    if (((get_collection_fn)VTBL(factory)[SLOT_FACTORY_GET_SYSTEM_FONT_COLLECTION])(factory, &collection, 0) >= 0
+            && ((get_indexed_fn)VTBL(collection)[SLOT_COLLECTION_GET_FONT_FAMILY])(collection, 0, &family) >= 0
+            && ((get_indexed_fn)VTBL(family)[SLOT_FAMILY_GET_FONT])(family, 0, &font) >= 0
+            && ((create_face_fn)VTBL(font)[SLOT_FONT_CREATE_FONT_FACE])(font, &face) >= 0)
+        wrap_slot(dwrite, &VTBL(face)[SLOT_FONT_FACE_GET_RECOMMENDED_RENDERING_MODE], (void *)recommend_hook, (void **)&real_recommend);
+
+    release(face);
+    release(font);
+    release(family);
+    release(collection);
+    release(factory);
+    if (real_analysis && real_recommend)
+        OutputDebugStringA("shfolderproxy: Direct2D text hooks installed in dwrite.dll\n");
+    return 0;
+}
+
+static void dwrite_loaded(BYTE *base)
+{
+    static volatile long started;
+    if (!is_wine_builtin(base) || __sync_lock_test_and_set(&started, 1)) return;
+    CreateThread(0, 0, patch_dwrite, base, 0, 0);
+}
+
 /* ---- Import table patching ---------------------------------------------- */
 
 static BYTE *data_directory(BYTE *base, int index, DWORD *size)
@@ -315,8 +505,11 @@ static void dll_loaded(DWORD reason, const DLL_NOTIFICATION_DATA *data, void *co
     (void)context;
     if (reason != LDR_DLL_NOTIFICATION_REASON_LOADED) return;
     patch_user32_delay_imports(data->dll_base);
-    if (data->base_name && wname_is(data->base_name->buffer, data->base_name->length / 2, "simbeor_sdk.dll"))
+    if (!data->base_name) return;
+    if (wname_is(data->base_name->buffer, data->base_name->length / 2, "simbeor_sdk.dll"))
         patch_bcrypt_imports(data->dll_base);
+    else if (wname_is(data->base_name->buffer, data->base_name->length / 2, "dwrite.dll"))
+        dwrite_loaded(data->dll_base);
 }
 
 BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
@@ -326,6 +519,7 @@ BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
     if (reason == DLL_PROCESS_ATTACH) {
         patch_user32_delay_imports(GetModuleHandleW(0));
         LdrRegisterDllNotification(0, (void *)dll_loaded, 0, &cookie);
+        if (GetModuleHandleW(L"dwrite.dll")) dwrite_loaded(GetModuleHandleW(L"dwrite.dll"));
     }
     return 1;
 }

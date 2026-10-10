@@ -66,6 +66,79 @@ writes a full dump and prints `clrthreads` and `clrstack -all`. Quirks under Win
 - `dotnet-stack report` collects fine but its parser calls
   `tdh.dll!TdhGetEventInformation`, which Wine lacks, and crashes.
 
+## Slow redraws: `scripts/redraw-bench.sh` and `scripts/profile.py`
+
+`redraw-bench.sh` measures how expensive a view's redraws are. With a document open, it
+posts mouse-wheel steps to the view's window (`build/postmsg.exe`, so the real keyboard
+and mouse stay free and nothing takes focus) and reports the CPU time of Altium's UI
+thread, which is the process's first thread. Every step renders the view again; half go
+down and half back up, so the view ends where it started. The UI thread uses some CPU
+even when left alone (8% here, timers and wineserver round trips); the script measures
+that first and reports what the redraws add:
+
+```
+$ scripts/redraw-bench.sh
+==> Scrolling SchView 000105e0 (10 steps, 1500 ms apart, 3 runs)
+run 1: 10 steps, 0.87 s UI-thread CPU above idle (87 ms per step); idle 8%, 2.2 s total
+run 2: 10 steps, 0.66 s UI-thread CPU above idle (66 ms per step); idle 8%, 2.2 s total
+run 3: 10 steps, 0.66 s UI-thread CPU above idle (66 ms per step); idle 8%, 2.2 s total
+```
+
+The default view is the schematic (`SchView`); `--class` takes another class from
+`scripts/wininfo.sh` (only `SchView` has been tried). Compare runs within one session, or
+fresh sessions with each other: the same redraws cost twice as much in a session that had
+been running for an hour (and had shown an error dialog).
+
+`profile.py` is a sampling profiler for the UI thread. Every 2 ms it stops the thread
+with ptrace (Wine processes accept any tracer), records the instruction pointer, the
+system call in progress and the stack words that look like return addresses, and lets
+it go. Run it around the benchmark:
+
+```bash
+scripts/profile.py --save build/redraw.json -- scripts/redraw-bench.sh --runs 1
+scripts/profile.py --load build/redraw.json --focus win32u   # report again, other filter
+```
+
+The report counts the samples taken while the thread was running (`--all` adds the
+sleeping ones) by module and by function, at the top of the stack ("self") and anywhere
+on it ("inclusive"), and by system call. How to read it:
+
+- Function names are the nearest exported symbol before the address (pefile for Windows
+  DLLs, `nm -D` for Unix libraries; `.so` files of the Flatpak runtime are read through
+  `/proc/<pid>/root`). Wine's DLLs, DXVK and Altium export little, so a name is a hint
+  about where the code is, not proof; code far from any export is listed as
+  `(unexported code)`. Without pefile the DLLs are listed by module only (the
+  `scan-missing-imports.py` docstring shows how to get it, or `uv run --with pefile`).
+- .NET code, compiled at runtime, shows up as `[anon]`; use `dotnet-stacks.sh` or the
+  decompiler below to see what it does.
+- Wine's Unix side runs on its own stack, so a sample taken in `win32u.so` or
+  `ntdll.so` shows the Unix frames but not the Windows code that called them.
+- `read` called from `ntdll.so` is a thread waiting for wineserver's reply: a high share
+  means many server round trips.
+- Sampling costs the thread a little time per sample; benchmark without the profiler.
+
+For the schematic (how-it-works §12) the first profile was mostly `d2d1.dll` and
+FreeType, which pointed at Direct2D text rather than GDI+.
+
+## .NET code: decompiling Altium's assemblies
+
+Much of Altium is .NET (`file X.dll` says "Mono/.Net assembly"), and reading the
+decompiled code is the quickest way to see what it asks Windows for. To find which
+assembly holds a class or setting, `grep -la NAME "$AD/System"/*.dll` (`$AD` is Altium's
+folder in the bottle). ILSpy's command-line decompiler runs without the .NET SDK, from
+its NuGet package and a .NET runtime (`dotnet --list-runtimes`; the package's
+`tools/net*` folder names the version it needs):
+
+```bash
+curl -sSL -o build/ilspycmd.nupkg https://www.nuget.org/api/v2/package/ilspycmd
+unzip -q build/ilspycmd.nupkg -d build/ilspycmd
+dotnet build/ilspycmd/tools/net10.0/any/ilspycmd.dll -p -o build/decompiled/painter \
+    -r "$AD/System" "$AD/System/Altium.Sch.Painter.dll"
+```
+
+`-p` writes a project with one file per class. Keep the output to yourself: it is
+Altium's code.
+
 ## Missing functions: `scripts/scan-missing-imports.py`
 
 Delay-loaded imports are resolved on first call, so a function Wine lacks only fails
@@ -82,6 +155,21 @@ differently from Wine, or windows that should not be top-levels at all.
 `build/clearex.exe <hwnd> <bits>` clears extended-style bits on a live window for
 experiments.
 
+`build/postmsg.exe <hwnd> <msg> <wparam> <lparam> [count] [delay ms]` (hex, except count
+and delay) posts a window message, for example to drive a view while you keep working in
+another window. Run these tools in the bottle's session (`wine_running` in
+`scripts/lib.sh`, as `wininfo.sh` does). Useful messages: `WM_MOUSEWHEEL` (`20a`; wParam
+`ff880000` scrolls down one step, `00780000` up; lParam is the screen point, `yyyyxxxx`)
+and `WM_CLOSE` (`10`) to the main window to close Altium. Altium ignores the Ctrl bit in
+a posted wheel message (it checks the real key state), so zooming needs the keyboard. Do
+not resize Altium's main window from the compositor in tests (`hyprctl dispatch
+resizewindowpixel`): twice in a row raised `Control 'View…' has no parent window`.
+
+To see a window without screenshotting the desktop, which may show something else on
+top, capture it through X11: `xprop -root _NET_CLIENT_LIST` lists Altium's X window ids,
+and `import -window <id> out.png` (ImageMagick) saves that window's contents even when
+another window covers it.
+
 ## Reading Wine's source
 
 Most root causes were confirmed in Wine's source: `programs/start/start.c`
@@ -89,5 +177,7 @@ Most root causes were confirmed in Wine's source: `programs/start/start.c`
 `dlls/winex11.drv/init.c` (`needs_offscreen_rendering`,
 `X11DRV_client_surface_present`), `dlls/ntdll/loader.c` (when DLL-load notifications
 fire relative to import resolution), `dlls/bcrypt/gnutls.c` at tag `wine-11.0`
-(RSA decryption). GitHub's `wine-mirror/wine` serves raw files when GitLab's bot
+(RSA decryption), `dlls/d2d1/device.c` (`d2d_device_context_draw_glyph_run`),
+`dlls/dwrite/font.c` (recommended rendering mode, glyph cache) and `dlls/dwrite/main.c`
+(default rendering parameters). GitHub's `wine-mirror/wine` serves raw files when GitLab's bot
 protection blocks scripted downloads.

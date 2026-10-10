@@ -23,7 +23,10 @@ same information is in the status bar.
 ## Panels jitter when dragged across monitors (mixed scaling)
 
 Dragging a floating panel, especially between monitors, makes it jump back and forth;
-once, after that, Altium reported `Control 'View…' has no parent window`.
+once, after that, Altium reported `Control 'View…' has no parent window`. The same error
+came back on a single laptop screen after resizing the main window twice from the
+compositor (`hyprctl dispatch resizewindowpixel`) with a schematic open, so window
+resizes may be enough to reproduce it.
 
 Likely cause: with Hyprland's `xwayland:force_zero_scaling = true` (Omarchy's default)
 and monitors with different scales, X11 and Hyprland disagree about coordinates. Here a

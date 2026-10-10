@@ -21,6 +21,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 9 | File menu / right-click: `External exception C06D007F` | `user32!InheritWindowMonitor` missing in Wine | `SHFolder.dll` proxy |
 | 10 | Opening a PCB kills Altium (`GnuTLS error: Decryption has failed`) | Wine's GnuTLS `bcrypt` ignores `BCRYPT_PAD_NONE` | `SHFolder.dll` proxy (raw RSA) |
 | 11 | PCB view one step behind on layer switches | Wine copies the off-screen child window before vsync updates it | `dxgi.syncInterval = 0` (experimental) |
+| 12 | Schematic text with missing strokes, slow schematic redraws | Wine's d2d1 picks the text rendering mode without the zoom transform, fills glyph outlines unantialiased | `SHFolder.dll` proxy (DirectWrite hooks) |
 
 ## 1. ICU error in the installer
 
@@ -236,3 +237,49 @@ slower.
 **Fix (unverified):** [`config/dxvk.conf`](../config/dxvk.conf) with
 `dxgi.syncInterval = 0`, so presents are immediate. DXVK reads `dxvk.conf` from the
 working directory, which Bottles sets to Altium's folder.
+
+## 12. Schematic text broken and redraws slow (Direct2D text)
+
+Small schematic text lost strokes: `U_Cell` read as `I. Cell`, every underscore was
+missing, and scrolling or zooming a sheet took close to a second per step.
+
+The schematic view does not use GDI+, although `AdvSch.dll` imports it: it is drawn by
+the .NET assemblies `Altium.Sch.Painter` and `Altium.GeometryMaker` through SharpDX
+with Direct2D and DirectWrite, which are Wine's builtin `d2d1` and `dwrite` (on top of
+DXVK's `d3d11`). A sampling profile of the UI thread during redraws
+(`scripts/profile.py` around `scripts/redraw-bench.sh`) was mostly `d2d1` and
+FreeType; decompiling the two assemblies (see debugging.md) showed how they
+draw text.
+
+Altium builds its geometry once in "world" units and applies the zoom as a Direct2D
+transform (`SchPainterSettings.DefaultDrawTransform` scales internal units by 0.00064,
+so 6.4 world units per mil). Text layouts are created at that size: a 10 pt label has
+an em size of about 900. Altium leaves the text antialias mode at its default.
+In Wine 11.0 (`dlls/d2d1/device.c`, `d2d_device_context_draw_glyph_run`):
+
+- The rendering mode comes from `IDWriteFontFace_GetRecommendedRenderingMode` with the
+  untransformed em size. At 100 and above it returns `OUTLINE`, so every run takes
+  `d2d_device_context_draw_glyph_run_outline`: a new path geometry from the glyph
+  outlines, triangulated on the CPU, on every frame. Wine's geometry fill ignores the
+  antialias mode, so the glyphs are rasterised with hard pixel coverage and strokes
+  thinner than a pixel disappear. Native Direct2D takes the transform into account.
+- In the bitmap path, `dwrite` bypasses its glyph cache whenever a transform is set
+  ("For now bypass cache for transformed cases" in `dlls/dwrite/font.c`), so FreeType
+  renders every glyph again on every frame.
+
+**Fix:** once Wine's builtin `dwrite.dll` has loaded, the `SHFolder.dll` proxy wraps two
+slots of its vtables, which every font face and factory share (a short thread does it
+outside the loader lock). Both wrappers act only on calls whose return address is in
+Wine's builtin `d2d1.dll`:
+
+- `IDWriteFontFace::GetRecommendedRenderingMode`: `OUTLINE` becomes
+  `NATURAL_SYMMETRIC`, so text is drawn from antialiased glyph bitmaps.
+- `IDWriteFactory2::CreateGlyphRunAnalysis`: for a uniform scale `s` (no rotation) and
+  natural measuring, the run is passed on with em size, advances and offsets multiplied
+  by `s`, the origin mapped through the matrix and no transform. The glyphs land in the
+  same places (now hinted at their on-screen size) and the glyph cache applies again.
+  Rotated text keeps the transform.
+
+On a 317 KB sheet, ten scroll steps posted to the view took 3.6 to 4.4 s of UI-thread
+CPU before and 0.8 s after, in fresh sessions (`scripts/redraw-bench.sh` measures this). If `dwrite.dll` or `d2d1.dll` is not Wine's builtin,
+nothing is patched.

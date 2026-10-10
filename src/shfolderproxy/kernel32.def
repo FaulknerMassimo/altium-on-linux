@@ -5,3 +5,4 @@ GetProcAddress
 VirtualProtect
 SetLastError
 OutputDebugStringA
+CreateThread

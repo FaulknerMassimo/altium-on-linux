@@ -5,3 +5,4 @@ WriteFile
 ExitProcess
 GetCurrentProcessId
 GetCommandLineW
+Sleep

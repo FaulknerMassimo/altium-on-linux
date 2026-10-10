@@ -14,3 +14,4 @@ GetWindow
 GetParent
 GetWindowThreadProcessId
 wsprintfA
+PostMessageW

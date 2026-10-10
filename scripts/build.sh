@@ -4,7 +4,7 @@
 # links against import libraries generated from the .def files next to it.
 #
 #   scripts/build.sh            -> build/cmd.exe, build/SHFolder.dll,
-#                                  build/wininfo.exe, build/clearex.exe
+#                                  build/wininfo.exe, build/clearex.exe, build/postmsg.exe
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -49,5 +49,6 @@ rm -f "$OUT/SHFolder.lib" "$OUT/SHFolder.exp"
 
 link_exe wininfo start_entry "$SRC/tools/wininfo.c" "$SRC/tools/user32.def" "$SRC/tools/kernel32.def"
 link_exe clearex start_entry "$SRC/tools/clearex.c" "$SRC/tools/user32.def" "$SRC/tools/kernel32.def"
+link_exe postmsg start_entry "$SRC/tools/postmsg.c" "$SRC/tools/user32.def" "$SRC/tools/kernel32.def"
 
 ls -l "$OUT"/*.exe "$OUT"/*.dll

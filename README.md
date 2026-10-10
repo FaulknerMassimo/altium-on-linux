@@ -20,7 +20,7 @@ redistributed here.
 | Sign-in through the browser, on-demand license | works |
 | Home page, menus, Preferences | work |
 | PCB editor, 2D and 3D | works |
-| Schematic editor | untested |
+| Schematic editor | opens and redraws, text fixed ([§12](docs/how-it-works.md#12-schematic-text-broken-and-redraws-slow-direct2d-text)); editing untested |
 | PCB view redraw after a layer switch | one step behind; fix in testing ([§11](docs/how-it-works.md#11-pcb-view-one-step-behind-experimental)) |
 | Heads-up display in the PCB view | dark box; press Shift+H to hide it |
 | Dragging floating panels across monitors with different scaling | jitters |
@@ -57,6 +57,7 @@ Hyprland rules only matter on Hyprland.
 | 9 | File menu / right-click: `External exception C06D007F` | `SHFolder.dll` proxy supplies `InheritWindowMonitor` |
 | 10 | Opening a PCB closes Altium (`GnuTLS error: Decryption has failed`) | `SHFolder.dll` proxy does raw RSA for the Simbeor license check |
 | 11 | PCB view one step behind | `dxvk.conf`: `dxgi.syncInterval = 0` (experimental) |
+| 12 | Schematic text with missing strokes and underscores, slow redraws | `SHFolder.dll` proxy routes Direct2D text through DirectWrite bitmaps |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.
@@ -154,7 +155,7 @@ In the PCB editor, press **Shift+H** to hide the heads-up display until it is fi
 | Where | What | Fix |
 |---|---|---|
 | `Program Files\Altium\AD26\cmd.exe` | shim: opens `cmd /c start <url>` links directly, passes everything else to the real `cmd.exe` | 6 |
-| `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor | 9, 10 |
+| `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text | 9, 10, 12 |
 | `Program Files\Altium\AD26\dxvk.conf` | `dxgi.syncInterval = 0` | 11 |
 | `windows\Fonts\segoeui-selawik*.ttf` | Selawik renamed to "Segoe UI", built locally from Microsoft's release | 8 |
 | `HKCU\Software\Wine\DllOverrides` | `tabtip.exe` disabled | 4 |
@@ -186,6 +187,8 @@ other changes are harmless to keep.
 | `scripts/dotnet-stacks.sh` | managed .NET stacks (`dotnet-dump`), for freezes |
 | `scripts/wininfo.sh` | Altium's windows as Wine sees them |
 | `scripts/scan-missing-imports.py` | Windows functions Altium delay-loads that Wine lacks |
+| `scripts/redraw-bench.sh` | time a view's redraws by posting scroll steps to it |
+| `scripts/profile.py` | sampling profiler for Altium's UI thread (modules, functions, system calls) |
 | `tests/test_rsa.py` | checks the raw RSA code against Python on random keys |
 
 ## Repository layout
@@ -197,8 +200,8 @@ fonts/           rename_to_segoeui.py (Selawik -> "Segoe UI")
 registry/        .reg files imported by install.sh
 scripts/         build, install, debugging tools (lib.sh is shared)
 src/cmdshim/     cmd.exe shim
-src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA)
-src/tools/       wininfo.exe, clearex.exe (diagnostics)
+src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA, Direct2D text)
+src/tools/       wininfo.exe, clearex.exe, postmsg.exe (diagnostics)
 tests/           raw RSA test
 ```
 
