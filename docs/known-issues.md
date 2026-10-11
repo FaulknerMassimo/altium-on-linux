@@ -31,6 +31,29 @@ where they ask to be. Hyprland exports the functions involved
 `CWindowTarget::desiredGeometry`), so a plugin could hook them; not attempted. Turning off
 `force_zero_scaling` does not fix the splash (see §17).
 
+## A Wine process can exit when a monitor goes away
+
+While testing the fix for stale monitor lists
+([how-it-works §19](how-it-works.md#19-altium-drawn-offset-after-a-monitor-goes-away-and-comes-back)),
+the bottle's `explorer.exe` exited once when a virtual monitor was removed (one removal out
+of three with it running):
+
+```
+X Error of failed request:  BadRROutput (invalid Output parameter)
+  Major opcode of failed request:  140 (RANDR)
+  Minor opcode of failed request:  9 (RRGetOutputInfo)
+```
+
+Wine read the list of outputs and then asked about one that XWayland had just removed.
+Wine's X error handler passes errors it does not expect to Xlib's default handler, which
+ends the process. Explorer owns the desktop window, so with Altium running this would
+likely take Altium down too. Altium can probably hit the same race in its own process.
+
+An Altium session ended about 20 seconds after the laptop lid was closed (its `X2.EXE`
+was left a zombie, with the rest of that Wine session still running and no wineserver).
+Its output was not logged, so whether this was the cause is not known. To find out, run
+Altium with `scripts/debug-launch.sh` and close the lid or unplug a monitor.
+
 ## Intermittent freeze while a project loads
 
 Seen three times: the documents appear but nothing responds, and the UI thread uses no

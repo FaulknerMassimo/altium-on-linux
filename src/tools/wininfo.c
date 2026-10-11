@@ -1,15 +1,30 @@
 /*
- * wininfo: list visible top-level windows (and the main window's children) as Wine
- * sees them: class, title, rect, style, exstyle, owner. Diagnostic for Altium under
- * Wine; no SDK or CRT needed (built by scripts/build.sh).
+ * wininfo: list the display adapters, the monitors and the visible top-level windows (and
+ * the main window's children) as Wine sees them: class, title, rect, style, exstyle, owner.
+ * Diagnostic for Altium under Wine; no SDK or CRT needed (built by scripts/build.sh).
  */
 
 typedef unsigned int DWORD;
 typedef int BOOL;
 typedef void *HANDLE;
 typedef void *HWND;
+typedef void *HMONITOR;
 typedef long long LONG_PTR;
 typedef struct { int left, top, right, bottom; } RECT;
+typedef struct { DWORD cbSize; RECT rcMonitor, rcWork; DWORD dwFlags; char szDevice[32]; } MONITORINFOEXA;
+typedef struct { DWORD cb; char DeviceName[32], DeviceString[128]; DWORD StateFlags; char DeviceID[128], DeviceKey[128]; } DISPLAY_DEVICEA;
+typedef struct {
+    char dmDeviceName[32];
+    unsigned short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+    DWORD dmFields;
+    int dmPositionX, dmPositionY;
+    DWORD dmDisplayOrientation, dmDisplayFixedOutput;
+    short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+    char dmFormName[32];
+    unsigned short dmLogPixels;
+    DWORD dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+    DWORD dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+} DEVMODEA;
 
 #define IMPORT __declspec(dllimport)
 IMPORT BOOL EnumWindows(BOOL (*cb)(HWND, LONG_PTR), LONG_PTR param);
@@ -17,6 +32,11 @@ IMPORT BOOL EnumChildWindows(HWND parent, BOOL (*cb)(HWND, LONG_PTR), LONG_PTR p
 IMPORT int GetClassNameA(HWND hwnd, char *buf, int len);
 IMPORT int GetWindowTextA(HWND hwnd, char *buf, int len);
 IMPORT BOOL GetWindowRect(HWND hwnd, RECT *rect);
+IMPORT BOOL EnumDisplayMonitors(void *hdc, const RECT *clip, BOOL (*cb)(HMONITOR, void *, RECT *, LONG_PTR), LONG_PTR param);
+IMPORT BOOL GetMonitorInfoA(HMONITOR monitor, MONITORINFOEXA *info);
+IMPORT BOOL SetProcessDPIAware(void);
+IMPORT BOOL EnumDisplayDevicesA(const char *device, DWORD index, DISPLAY_DEVICEA *dd, DWORD flags);
+IMPORT BOOL EnumDisplaySettingsA(const char *device, DWORD mode, DEVMODEA *dm);
 IMPORT BOOL IsWindowVisible(HWND hwnd);
 IMPORT LONG_PTR GetWindowLongPtrA(HWND hwnd, int index);
 IMPORT HWND GetWindow(HWND hwnd, unsigned cmd);
@@ -59,6 +79,40 @@ static void describe(HWND hwnd, const char *indent)
     out(line);
 }
 
+static void list_adapters(void)
+{
+    DISPLAY_DEVICEA dd;
+    DEVMODEA dm;
+    char line[512];
+    for (DWORD i = 0;; i++) {
+        dd.cb = sizeof(dd);
+        if (!EnumDisplayDevicesA(0, i, &dd, 0)) break;
+        dm.dmSize = sizeof(dm);
+        dm.dmDriverExtra = 0;
+        if (!EnumDisplaySettingsA(dd.DeviceName, (DWORD)-1 /* ENUM_CURRENT_SETTINGS */, &dm))
+            dm.dmPositionX = dm.dmPositionY = dm.dmPelsWidth = dm.dmPelsHeight = 0;
+        wsprintfA(line, "adapter %s flags=%08x mode [%d,%d %ux%u] \"%s\"\r\n", dd.DeviceName, dd.StateFlags,
+                  dm.dmPositionX, dm.dmPositionY, dm.dmPelsWidth, dm.dmPelsHeight, dd.DeviceString);
+        out(line);
+    }
+}
+
+static BOOL monitor_cb(HMONITOR monitor, void *hdc, RECT *rect, LONG_PTR param)
+{
+    MONITORINFOEXA mi;
+    char line[256];
+    (void)hdc; (void)rect; (void)param;
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA(monitor, &mi)) return 1;
+    wsprintfA(line, "monitor %s [%d,%d %dx%d] work [%d,%d %dx%d]%s\r\n", mi.szDevice,
+              mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+              mi.rcMonitor.bottom - mi.rcMonitor.top, mi.rcWork.left, mi.rcWork.top,
+              mi.rcWork.right - mi.rcWork.left, mi.rcWork.bottom - mi.rcWork.top,
+              (mi.dwFlags & 1) ? " primary" : "");
+    out(line);
+    return 1;
+}
+
 static BOOL child_cb(HWND hwnd, LONG_PTR param)
 {
     (void)param;
@@ -83,6 +137,9 @@ static BOOL top_cb(HWND hwnd, LONG_PTR param)
 
 void start_entry(void)
 {
+    SetProcessDPIAware(); /* physical pixels, like Altium (system DPI aware) */
+    list_adapters();
+    EnumDisplayMonitors(0, 0, monitor_cb, 0);
     EnumWindows(top_cb, 0);
     if (main_window) {
         out("--- visible children of the Altium main window:\r\n");

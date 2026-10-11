@@ -24,6 +24,7 @@ redistributed here.
 | PCB and schematic views showing the previous frame | fixed ([§11](docs/how-it-works.md#11-pcb-and-schematic-views-one-frame-behind-vulkan-present-race)), without capping the PCB view's redraw rate (over 200 redraws/s); the schematic redraws about 50 times a second on a large sheet ([§18](docs/how-it-works.md#18-slow-schematic-redraws-a-direct3d-state-swap-per-shape)) |
 | Heads-up display in the PCB view | fixed ([§14](docs/how-it-works.md#14-heads-up-display-frozen-in-the-pcb-view-layered-child-windows)); drawn over black rather than blended with the board |
 | Two monitors with different scaling | Altium's windows open on the external monitor ([§17](docs/how-it-works.md#17-windows-split-across-monitors-hyprland-mixed-scaling)); moving them to the laptop screen, or starting Altium from it, still misplaces them ([known issues](docs/known-issues.md#windows-misplaced-on-the-other-monitor-mixed-scaling)) |
+| Closing the lid, switching a monitor off and on | Altium follows the new layout ([§19](docs/how-it-works.md#19-altium-drawn-offset-after-a-monitor-goes-away-and-comes-back)); needs the Hyprland hook |
 | Loading a project | occasionally freezes (seen three times); can be unfrozen without a restart ([known issues](docs/known-issues.md#intermittent-freeze-while-a-project-loads)) |
 
 The full list, with what is known about each, is in [docs/known-issues.md](docs/known-issues.md).
@@ -64,6 +65,7 @@ Hyprland rules only matter on Hyprland.
 | 16 | Error dialog `Control 'View…' has no parent window`, now and then | `SHFolder.dll` proxy clears a panel's stale focus pointer instead of creating a window for it |
 | 17 | Two monitors at different scales (Hyprland): splash split across them, Messages panel on the other screen | external monitor made X11's primary, so Wine and Altium put their windows there |
 | 18 | Schematic redraws slow (24 a second on a large sheet) | `SHFolder.dll` proxy skips Wine's Direct3D state swaps around every Direct2D shape |
+| 19 | After a monitor goes away and comes back (closed lid, monitor off): Altium drawn offset, dialogs off-screen, a monitor lost | registry: `EmulateModeset=N`; Hyprland hook resyncs Wine's monitor list (`scripts/refresh-displays.sh`) |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.
@@ -103,7 +105,11 @@ Add [`config/hyprland/altium.lua`](config/hyprland/altium.lua) to
 `~/.config/hypr/hyprland.lua`. It floats Altium's windows (tiling hides dialogs behind
 the main window), stops Wine's activate requests from warping the cursor, and with an
 external monitor connected makes it X11's primary output, so Altium opens its windows there
-([§17](docs/how-it-works.md#17-windows-split-across-monitors-hyprland-mixed-scaling)). On older
+([§17](docs/how-it-works.md#17-windows-split-across-monitors-hyprland-mixed-scaling)). Whenever
+a monitor is added, removed or resized, it runs `scripts/refresh-displays.sh` to resync
+Wine's monitor list
+([§19](docs/how-it-works.md#19-altium-drawn-offset-after-a-monitor-goes-away-and-comes-back));
+set `altium_on_linux` in it to where you cloned this repository. On older
 Hyprland versions with `hyprland.conf`, write the same two rules in your version's
 `windowrule` syntax: `float` and `focus_on_activate off`, matched on class
 `steam_app_altium`, and add `exec-once = xrandr --output <external monitor> --primary`.
@@ -194,7 +200,8 @@ bottle variable `VK_ADD_IMPLICIT_LAYER_PATH`; the other changes are harmless to 
 | `scripts/watchdog.sh` | kill Altium above a memory limit, log its memory |
 | `scripts/backtrace.sh` | native stacks of every thread (`winedbg`) |
 | `scripts/dotnet-stacks.sh` | managed .NET stacks (`dotnet-dump`), for freezes |
-| `scripts/wininfo.sh` | Altium's windows as Wine sees them |
+| `scripts/wininfo.sh` | Wine's monitors and Altium's windows as Wine sees them |
+| `scripts/refresh-displays.sh` | resync Wine's monitor list after a monitor change (run by the Hyprland hook) |
 | `scripts/scan-missing-imports.py` | Windows functions Altium delay-loads that Wine lacks |
 | `scripts/redraw-bench.sh` | time a view's redraws by posting scroll steps to it |
 | `scripts/profile.py` | sampling profiler for Altium's UI thread (modules, functions, system calls) |
@@ -212,7 +219,7 @@ scripts/         build, install, debugging tools (lib.sh is shared)
 src/cmdshim/     cmd.exe shim
 src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA, Direct2D text, layered windows, Direct2D arcs, VCL focus)
 src/presentwait/ Vulkan layer that waits for each present (Linux)
-src/tools/       wininfo.exe, clearex.exe, postmsg.exe (diagnostics)
+src/tools/       wininfo.exe, clearex.exe, postmsg.exe (diagnostics), displayfix.exe (monitor list)
 tests/           raw RSA and Direct2D arc tests
 ```
 

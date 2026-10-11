@@ -28,6 +28,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 16 | Error dialog `Control 'View…' has no parent window`, now and then | a panel form keeps a removed view as its active control; VCL creates a window for it on the next focus change | `SHFolder.dll` proxy (VCL `DoNestedActivation`) |
 | 17 | With two monitors: splash split across them, Messages panel on the other screen, too big | Hyprland misplaces X11 windows that open or move on a monitor other than the focused one when the monitors' scales differ; Wine's primary monitor is the laptop | external monitor made X11's primary (Hyprland hook) |
 | 18 | Schematic redraws slow (24 a second on a 346 KB sheet) | Wine's d2d1 swaps the whole Direct3D context state twice per shape, and DXVK copies and rebinds it every time | `SHFolder.dll` proxy skips the swaps while nothing else uses the context |
+| 19 | After a monitor goes away and comes back: Altium drawn offset and cropped, dialogs off-screen | Proton keeps each output's first recorded mode (emulated mode changes) and cannot repoint its per-slot registry links, so a reconnected monitor gets a stale size, a lost slot or a second primary | `EmulateModeset=N`; Hyprland hook runs `refresh-displays.sh`, which deletes the slot links so Wine rebuilds them |
 
 ## 1. ICU error in the installer
 
@@ -697,3 +698,84 @@ One session out of 17 with this hook crashed on its first schematic frame, in DX
 memory allocator under `ID3D11Device::CreateBuffer` called from d2d1 (a corrupted free
 list). It did not happen again in 16 sessions; the cause is not known. See
 [known-issues.md](known-issues.md#smaller-things).
+
+## 19. Altium drawn offset after a monitor goes away and comes back
+
+With Altium running on the external monitor, the laptop lid was closed, the external
+monitor switched off (the laptop suspended), then both came back. Altium then drew its
+window offset and cropped inside its frame, part of it twice, and the "Unsaved Changes"
+dialog it opened was 5766 pixels wide and mostly off-screen.
+
+Altium had a stale monitor list. `scripts/wininfo.sh` lists Wine's adapters and monitors
+before the windows:
+
+```
+adapter \\.\DISPLAY1 flags=00000005 mode [0,0 2560x1440]
+adapter \\.\DISPLAY2 flags=00000005 mode [-2880,0 2880x1800]
+monitor \\.\DISPLAY2 [-2880,0 2880x1800] work [-2880,0 2880x1800] primary
+```
+
+X11 had the external monitor at (0,0), primary, and the laptop at x 2560. Wine had two
+adapters flagged primary, the external monitor with the laptop's size 2880 px to its left,
+and no laptop. Two separate bugs in Proton's `win32u` produce this. Both come from keeping
+per-output state across a session while XWayland gives every reconnected monitor a new
+XRandR output id (here 0946, 0cc2, 0cc4, then 0cc6 for the external monitor and 0cc8 for
+the laptop).
+
+1. **Emulated mode changes.** Proton fakes display mode changes for games
+   (`emulate_modeset`, on by default). Each output's mode is kept under `HKLM\System\
+   CurrentControlSet\Hardware Profiles\Current\System\CurrentControlSet\Control\Video\
+   {gpu}\Sources\<output id>` as `Current`, and when Wine rebuilds its list, `add_modes`
+   keeps that stored mode, which it takes to be one a game set, over the one the X server
+   reports (stored as `Physical`). A mode recorded while the monitors were coming back
+   stayed: output 0cc6 kept 2880x1800 at −2880 although it was the 2560x1440 monitor at
+   (0,0). With a virtual output resized from 1920x1080 to 1280x720, `Physical` changed and
+   `Current`, which every program sees, did not.
+2. **Display slots that never move.** Programs other than explorer read the list through
+   one registry link per slot (`...\Control\Video\{gpu}\0000`, `0001`, ...), each pointing
+   at a `Sources\<output id>` key. `write_source_to_registry` cannot point an existing link
+   at another output: it opens the key with `REG_OPTION_CREATE_LINK`, which on an existing
+   link opens the target, so it writes `SymbolicLinkValue` into the old output's key (those
+   keys had a stray `SymbolicLinkValue`) and the link stays where it was. Each slot keeps the
+   output that first held it. Here slot 0 was still 0946, the external monitor before the
+   suspend, slot 1 was 0cc6, and the laptop had no slot. Explorer itself handles X11's
+   events and has the right list; Altium does not.
+
+Only explorer reacts to XRandR events (`xrandr14_device_change_handler`), and only to
+changes to outputs and CRTCs: making another output primary sends none, so Wine keeps the
+previous primary until the next event.
+
+Altium's windows follow from the stale list. Each process that loads the list also hands
+its monitors to wineserver (`set_winstation_monitors`), which maps window rectangles
+between DPI scales with them. Wine had the main window at 3170x1737 while its X11 window
+was 2536x1390 (1.25 times, the bottle's 120 DPI), and a DPI-unaware program read its left
+edge as 35788973.
+
+**Fix**, in two parts:
+
+- `"EmulateModeset"="N"` under `HKCU\Software\Wine\X11 Driver`
+  ([`registry/altium-fixes.reg`](../registry/altium-fixes.reg)). In this runner `"N"`
+  turns the emulation off and `"Y"` keeps it (the opposite of Proton 10's source). Wine
+  then stores the mode the X server reports. Altium never changes display modes.
+- [`scripts/refresh-displays.sh`](../scripts/refresh-displays.sh), run by the Hyprland hook
+  in [`config/hyprland/altium.lua`](../config/hyprland/altium.lua) three seconds after any
+  monitor is added, removed or resized (`monitor.layout_changed`), and after the external
+  monitor is made primary. When the bottle is running, it runs `displayfix.exe`, which
+  deletes the slot links (opened with `REG_OPTION_OPEN_LINK`, so the link itself and not
+  its target), then `wininfo.exe`. A process that finds no slots rebuilds the list from
+  X11, recreating the links. Changing the list bumps wineserver's monitor serial, and every
+  process, Altium and explorer included, reloads it. `displayfix.exe` refuses to run
+  without `DISPLAY`: a process without X11 would rebuild the list from Wine's stand-in
+  driver (one 1024x768 monitor). `in_running_bottle` in `scripts/lib.sh` passes the
+  session's display variables, since `flatpak enter` starts with an empty environment.
+
+Tested with Hyprland's headless outputs: add one, make it primary and resize it, make the
+external monitor primary again, remove it. With the stock settings, Wine was stale or
+inconsistent after several steps. With the fix, its list matched `xrandr --listmonitors` after
+every step: primary first and at (0,0), the right sizes and positions, nothing missing or
+doubled. With Altium running, the original state was repaired in place, without the hook,
+by deleting the stale `Current` value of 0cc6 and adding and removing a headless output to
+make explorer rebuild the list.
+
+Not fixed: a Wine process can exit while monitors change (see
+[known-issues.md](known-issues.md#a-wine-process-can-exit-when-a-monitor-goes-away)).

@@ -165,9 +165,15 @@ address to a module with a `+loaddll` log, then look for its imports.
 
 ## Windows: `scripts/wininfo.sh`
 
-Lists Altium's windows as Wine sees them (class, title, rect, style, exstyle, owner,
-parent). Compare with `hyprctl clients -j` to find windows the compositor places
-differently from Wine, or windows that should not be top-levels at all.
+Lists Wine's display adapters and monitors (in physical pixels, as Altium sees them), then
+Altium's windows (class, title, rect, style, exstyle, owner, parent). Compare the monitors
+with `xrandr --listmonitors`: Wine's primary is at (0,0) and every other monitor is offset
+by the X11 primary's position. A missing monitor, two adapters flagged primary (`flags`
+0x4) or a size that X11 does not have is the stale list of
+[how-it-works §19](how-it-works.md#19-altium-drawn-offset-after-a-monitor-goes-away-and-comes-back);
+`scripts/refresh-displays.sh` repairs it in a running session. Compare the windows with
+`hyprctl clients -j` to find windows the compositor places differently from Wine, or
+windows that should not be top-levels at all.
 `build/clearex.exe <hwnd> <bits>` clears extended-style bits on a live window for
 experiments.
 

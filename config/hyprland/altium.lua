@@ -16,15 +16,24 @@ o.window("^steam_app_altium$", { float = true, focus_on_activate = false })
 -- Takes effect the next time the bottle starts.
 local altium_primary = nil -- an output name such as "DP-1"; nil: the first external monitor
 
+-- Monitors plugged, unplugged or rearranged while Altium runs (a closed lid, a monitor
+-- switched off and on) leave Wine with a stale monitor list: a lost monitor, two primaries,
+-- Altium drawing offset inside its window. scripts/refresh-displays.sh resyncs it; it does
+-- nothing while the bottle isn't running (docs/how-it-works.md §19).
+local altium_on_linux = os.getenv("HOME") .. "/altium-on-linux" -- where you cloned the repository
+local altium_refresh_displays = altium_on_linux .. "/scripts/refresh-displays.sh --quiet"
+
 local function altium_wants_primary(name)
   if altium_primary then return name == altium_primary end
   return not (name:match("^eDP") or name:match("^LVDS") or name:match("^DSI"))
 end
 
 local function altium_set_x11_primary(name)
-  -- XWayland adds a monitor's output a moment after Hyprland does: retry for 10 s.
+  -- XWayland adds a monitor's output a moment after Hyprland does: retry for 10 s. Wine
+  -- sees no event for a new primary, so resync it afterwards.
   hl.exec_cmd("for i in $(seq 20); do xrandr --listmonitors 2>/dev/null | grep -q ' " .. name ..
-    "$' && exec xrandr --output " .. name .. " --primary; sleep 0.5; done")
+    "$' && { xrandr --output " .. name .. " --primary; sleep 1; exec " .. altium_refresh_displays ..
+    "; }; sleep 0.5; done")
 end
 
 hl.on("hyprland.start", function()
@@ -35,4 +44,9 @@ end)
 
 hl.on("monitor.added", function(m)
   if altium_wants_primary(m.name) then altium_set_x11_primary(m.name) end
+end)
+
+-- Fires for added, removed and resized monitors; wait for XWayland to settle.
+hl.on("monitor.layout_changed", function()
+  hl.exec_cmd("sleep 3; " .. altium_refresh_displays)
 end)

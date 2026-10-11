@@ -6,3 +6,4 @@ ExitProcess
 GetCurrentProcessId
 GetCommandLineW
 Sleep
+GetEnvironmentVariableA

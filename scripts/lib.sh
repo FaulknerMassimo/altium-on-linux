@@ -51,17 +51,33 @@ altium_pid() {
     done
 }
 
+# PID of the bottle's wineserver, if it is running.
+wineserver_pid() {
+    local pid
+    for pid in $(bottle_pids); do
+        if tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | sed -n 1p | grep -q '/wineserver$'; then echo "$pid"; return; fi
+    done
+}
+
 # Run a command inside the Flatpak sandbox of the bottle's running Wine session, so it
 # talks to the same wineserver. (A second `flatpak run` gets its own /tmp and would
-# start a second wineserver on the same prefix, which corrupts the registry.)
+# start a second wineserver on the same prefix, which corrupts the registry.) Prefers the
+# wineserver's sandbox: processes of an earlier session can outlive their wineserver.
+# `flatpak enter` starts with an empty environment, so the session's display variables are
+# passed along (without DISPLAY, Wine falls back to a fake 1024x768 display).
 in_running_bottle() {
-    local pids pid instance
-    pids=$(bottle_pids)  # no `| head -1`: with pipefail its SIGPIPE would fail the caller
-    pid=${pids%%$'\n'*}
+    local pids pid instance vars
+    pid=$(wineserver_pid)
+    if [ -z "$pid" ]; then
+        pids=$(bottle_pids)  # no `| head -1`: with pipefail its SIGPIPE would fail the caller
+        pid=${pids%%$'\n'*}
+    fi
     [ -n "$pid" ] || die "the bottle is not running"
     instance=$(sed -n 's/^instance-id=//p' "/proc/$pid/root/.flatpak-info" 2>/dev/null)
     [ -n "$instance" ] || die "cannot find the Flatpak sandbox of PID $pid"
-    flatpak enter "$instance" env HOME="$HOME" WINEPREFIX="$BOTTLE_DIR" "$@"
+    mapfile -t vars < <(tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" \
+        | grep -E '^(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY|XDG_RUNTIME_DIR)=')
+    flatpak enter "$instance" env "${vars[@]}" HOME="$HOME" WINEPREFIX="$BOTTLE_DIR" "$@"
 }
 
 # wine_running ARGS...: run "wine ARGS" in the bottle's running session.

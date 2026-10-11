@@ -127,6 +127,7 @@ if [ "$DRY" = 0 ]; then
     check "tabtip.exe disabled" '"tabtip.exe"=""' "$BOTTLE_DIR/user.reg"
     check "WPF software rendering" '"DisableHWAcceleration"=dword:00000001' "$BOTTLE_DIR/user.reg"
     check "SHFolder proxy override" '"shfolder"="native,builtin"' "$BOTTLE_DIR/user.reg"
+    check "real display modes" '"EmulateModeset"="N"' "$BOTTLE_DIR/user.reg"
     [ "$FONTS" = 0 ] || check "Segoe UI font" '"Segoe UI (TrueType)"="segoeui-selawik.ttf"' "$BOTTLE_DIR/system.reg"
     [ "${#install_keys[@]}" -eq 0 ] || check "browser sign-in" '"UnifiedLogin"="1"' "$BOTTLE_DIR/user.reg"
     check "SteamAppId" 'SteamAppId: altium' "$BOTTLE_DIR/bottle.yml"

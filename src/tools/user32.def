@@ -5,6 +5,11 @@ EnumChildWindows
 GetClassNameA
 GetWindowTextA
 GetWindowRect
+EnumDisplayMonitors
+GetMonitorInfoA
+SetProcessDPIAware
+EnumDisplayDevicesA
+EnumDisplaySettingsA
 IsWindowVisible
 GetWindowLongPtrA
 SetWindowLongPtrA
