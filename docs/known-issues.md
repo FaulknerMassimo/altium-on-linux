@@ -3,27 +3,33 @@
 What still goes wrong, what is known about each problem, and where to dig next.
 Contributions welcome: [debugging.md](debugging.md) has the tools.
 
-## Panels jitter when dragged across monitors (mixed scaling)
+## Windows misplaced on the other monitor (mixed scaling)
 
-Dragging a floating panel, especially between monitors, makes it jump back and forth;
-once, after that, Altium reported `Control 'View…' has no parent window`. That error had
-other triggers too and is now fixed
-([how-it-works §16](how-it-works.md#16-control-view-has-no-parent-window-stale-active-control)).
+With monitors at different scales, Hyprland misplaces X11 windows that open or move on a
+monitor other than the focused one
+([how-it-works §17](how-it-works.md#17-windows-split-across-monitors-hyprland-mixed-scaling)).
+Making the external monitor X11's primary keeps Altium's windows on it, which covers
+working on the external monitor. Still broken:
 
-Likely cause: with Hyprland's `xwayland:force_zero_scaling = true` (Omarchy's default)
-and monitors with different scales, X11 and Hyprland disagree about coordinates. Here a
-2880x1800 laptop at 1.5x and a 2560x1440 monitor at 1x:
+- Starting Altium while the laptop has the focus: the splash and the main window ask for
+  the external monitor and are moved onto the laptop, and the splash comes apart again.
+- Moving Altium windows onto the laptop. A floating panel dragged between monitors jumps
+  back and forth: Altium moves the panel itself while it is dragged, and each position on
+  the other monitor lands 960 px off. A panel left on the laptop is shown 1.5 times too big,
+  and Altium saves that size. Once, after such a drag, Altium reported
+  `Control 'View…' has no parent window`; that error had other triggers too and is fixed
+  ([how-it-works §16](how-it-works.md#16-control-view-has-no-parent-window-stale-active-control)).
+- Using the laptop alone after working docked: dialog positions saved on the laptop while
+  the external monitor was primary are negative. Whether Altium pulls such a dialog back
+  on screen has not been checked.
 
-| | Laptop | External monitor |
-|---|---|---|
-| X11 (`xrandr --listmonitors`) | 2880x1800 at x=0 | starts at x=2880 |
-| Hyprland (logical) | 1920x1200 at x=0 | starts at x=1920 |
-
-Windows that Altium positions itself (panels while dragging) land 960 px off, Altium
-corrects, and the two keep fighting. Toggling `force_zero_scaling` with `hyprctl eval` did
-not update XWayland's layout until a restart, so this is untested. Things to try: put the
-external monitor at x=0 (then its X11 and logical coordinates match), or turn
-`force_zero_scaling` off and accept blurrier X11 apps on the laptop screen.
+The real fix belongs in Hyprland: convert an X11 position with the monitor it lies on (in
+both directions), move the window to that monitor, and leave override-redirect windows
+where they ask to be. Hyprland exports the functions involved
+(`CHyprXWaylandManager::xwaylandToWaylandCoords` and `waylandToXWaylandCoords`,
+`CWindow::onX11ConfigureRequest`, `CWindow::unmanagedSetGeometry`,
+`CWindowTarget::desiredGeometry`), so a plugin could hook them; not attempted. Turning off
+`force_zero_scaling` does not fix the splash (see §17).
 
 ## Intermittent freeze while a project loads
 
@@ -113,6 +119,11 @@ sign-in step and installed normally; sign in afterwards from Altium.
 - **Orange box** at the bottom-left of the PCB view, origin unknown.
 - **"Not Signed In"** after starting Altium with a file on the command line; the license
   still works. Sign in from the account menu if needed.
+- **`Runtime error 217` when starting Altium** (once): the previous session's wineserver
+  was gone, but its `services.exe`, `explorer.exe`, `winedevice.exe` and six WebView2
+  helpers were still running. After ending them, Altium started. If processes are left in
+  the bottle after Altium closes (`pgrep -af 'msedgewebview2|explorer.exe'`), end them
+  before starting it again.
 - **Starting from Bottles once hung** at about 110 MB with no window; the process was gone
   before it could be inspected. A second start worked.
 - **The embedded WebView2 sign-in** never renders; browser sign-in replaces it. The

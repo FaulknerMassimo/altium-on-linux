@@ -23,7 +23,7 @@ redistributed here.
 | Schematic editor | opens and redraws; text ([§12](docs/how-it-works.md#12-schematic-text-broken-and-redraws-slow-direct2d-text)) and symbols drawn with arcs, such as inductors ([§15](docs/how-it-works.md#15-blank-schematic-symbols-inductors-direct2d-arcs)), fixed; editing works |
 | PCB and schematic views showing the previous frame | fixed ([§11](docs/how-it-works.md#11-pcb-and-schematic-views-one-frame-behind-vulkan-present-race)) |
 | Heads-up display in the PCB view | fixed ([§14](docs/how-it-works.md#14-heads-up-display-frozen-in-the-pcb-view-layered-child-windows)); drawn over black rather than blended with the board |
-| Dragging floating panels across monitors with different scaling | jitters |
+| Two monitors with different scaling | Altium's windows open on the external monitor ([§17](docs/how-it-works.md#17-windows-split-across-monitors-hyprland-mixed-scaling)); moving them to the laptop screen, or starting Altium from it, still misplaces them ([known issues](docs/known-issues.md#windows-misplaced-on-the-other-monitor-mixed-scaling)) |
 | Loading a project | occasionally freezes (seen three times); can be unfrozen without a restart ([known issues](docs/known-issues.md#intermittent-freeze-while-a-project-loads)) |
 
 The full list, with what is known about each, is in [docs/known-issues.md](docs/known-issues.md).
@@ -62,6 +62,7 @@ Hyprland rules only matter on Hyprland.
 | 14 | PCB heads-up display frozen in the view, a live copy in the corner of the screen on every workspace | `SHFolder.dll` proxy draws layered child windows into their parent |
 | 15 | Schematic symbols drawn with arcs (inductors) blank | `SHFolder.dll` proxy implements Direct2D arcs |
 | 16 | Error dialog `Control 'View…' has no parent window`, now and then | `SHFolder.dll` proxy clears a panel's stale focus pointer instead of creating a window for it |
+| 17 | Two monitors at different scales (Hyprland): splash split across them, Messages panel on the other screen | external monitor made X11's primary, so Wine and Altium put their windows there |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.
@@ -99,10 +100,12 @@ flatpak run --command=bottles-cli com.usebottles.bottles edit -b Altium --env-va
 
 Add [`config/hyprland/altium.lua`](config/hyprland/altium.lua) to
 `~/.config/hypr/hyprland.lua`. It floats Altium's windows (tiling hides dialogs behind
-the main window) and stops Wine's activate requests from warping the cursor. On older
+the main window), stops Wine's activate requests from warping the cursor, and with an
+external monitor connected makes it X11's primary output, so Altium opens its windows there
+([§17](docs/how-it-works.md#17-windows-split-across-monitors-hyprland-mixed-scaling)). On older
 Hyprland versions with `hyprland.conf`, write the same two rules in your version's
 `windowrule` syntax: `float` and `focus_on_activate off`, matched on class
-`steam_app_altium`.
+`steam_app_altium`, and add `exec-once = xrandr --output <external monitor> --primary`.
 
 ### 4. Install Altium
 

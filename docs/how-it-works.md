@@ -26,6 +26,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 14 | PCB heads-up display frozen in the view, a live copy in the corner of the screen on every workspace | Wine gives a layered child window its own top-level X window | `SHFolder.dll` proxy (layered child windows) |
 | 15 | Schematic symbols drawn with arcs (inductors) blank | Wine's d2d1 does not implement `ID2D1GeometrySink::AddArc` | `SHFolder.dll` proxy (Direct2D arcs) |
 | 16 | Error dialog `Control 'View…' has no parent window`, now and then | a panel form keeps a removed view as its active control; VCL creates a window for it on the next focus change | `SHFolder.dll` proxy (VCL `DoNestedActivation`) |
+| 17 | With two monitors: splash split across them, Messages panel on the other screen, too big | Hyprland misplaces X11 windows that open or move on a monitor other than the focused one when the monitors' scales differ; Wine's primary monitor is the laptop | external monitor made X11's primary (Hyprland hook) |
 
 ## 1. ICU error in the installer
 
@@ -516,3 +517,95 @@ Not covered: VCL also uses the active control when a form is activated through
 `WM_ACTIVATE` (`SetWindowFocus`). The fix clears the stale pointer at the first
 `CM_ACTIVATE` or `CM_DEACTIVATE`, so that path would only fail if it came first; it has not
 been seen.
+
+## 17. Windows split across monitors (Hyprland, mixed scaling)
+
+With a laptop screen at 1.5x and an external monitor at 1x, and Altium started from the
+external monitor:
+
+- the splash screen came apart: its centre (logo and version) on the laptop, its circuit
+  board on the external monitor, the pieces overlapping each other;
+- the main window opened on the external monitor, but the floating Messages panel (shown
+  when a project with warnings opens) on the laptop, partly past its left edge and too big;
+- once dragged across, floating panels kept the wrong size.
+
+Omarchy sets `xwayland:force_zero_scaling = true`, so X11 (and Wine) see each monitor at its
+physical size, laid out left to right, while Hyprland's own layout uses scaled sizes:
+
+| | Laptop (2880x1800, scale 1.5) | External (2560x1440, scale 1) |
+|---|---|---|
+| X11 | x 0 to 2880 | x 2880 to 5440 |
+| Hyprland | x 0 to 1920 | x 1920 to 4480 |
+
+Hyprland converts between the two per monitor, and in two places it picks the wrong one.
+Both are in Hyprland 0.56.2 and still in its development branch (October 2026):
+
+1. **Opening a window.** A new window belongs to the focused monitor. If the position it
+   asks for is on another monitor, `CWindowTarget::desiredGeometry` moves it onto the
+   focused one: it converts the position with the monitor it is on (dividing by 1.5) and
+   shifts it by the difference between the monitors' origins, but leaves the size in X11
+   pixels. It does this for override-redirect windows too (popups, which X11 window managers
+   must not move), one window at a time, so windows placed relative to each other come
+   apart.
+2. **Moving a window.** Later positions from the client (`CWindow::onX11ConfigureRequest`,
+   and `unmanagedSetGeometry` for override-redirect windows) are converted with the monitor
+   the window belongs to (`xwaylandToWaylandCoords(pos, m_monitor)`), wherever the position
+   is. A position on the laptop is then read with the external monitor's formula: 960 px
+   (2880 − 1920) too far left, y not scaled, and the window keeps the external monitor's
+   scale, so on the laptop it is 1.5 times too big.
+
+Wine's side of it: XWayland sets no primary output, so Wine takes the monitor at X11 (0,0),
+the laptop, as its primary and puts it at Windows (0,0). Altium centres the splash on the
+primary monitor and saves the main window and its floating panels as percentages of it
+(`UserTools.TLT` in Altium's roaming settings: `FormNormalRect='0.42, 2.11, 88.47, 79.33'`
+is the main window, `FrameFloatRect` each floating frame), so nearly every window it opens
+asks for a place on the laptop.
+
+Evidence: X11 events on the root window (creation, mapping, every geometry change) logged
+next to `hyprctl clients`, during a start and while a project opened:
+
+- Splash, five override-redirect windows: the centre mapped at 466,123 and Hyprland moved
+  it to 3191,82 (path 1); Altium then moved it to its final place, 1141,813, which Hyprland
+  showed at 181,813 (path 2; right would be 761,542). The four shadow windows mapped at
+  their final places, 1123 to 1876, and were each moved to 3629 to 3854 (path 1): the
+  right one now started inside the centre.
+- Messages panel: mapped at 514,249, 1863x1127; Hyprland moved it to 3223,166 (path 1);
+  17 ms later Altium put it back at 514,249, which Hyprland showed at −446,249 (path 2).
+- Main window: asked for 12,38 and was moved to the external monitor (path 1); Altium did
+  not move it back, so it stayed there.
+- Plain X11 test windows behave the same, without Wine.
+
+Turning off `force_zero_scaling` would make the two layouts equal, but would not fix the
+splash: path 1 still moves each window onto the focused monitor, and the centre's later move
+takes it back.
+
+**Fix:** make the external monitor X11's primary output (`xrandr --output HDMI-A-1
+--primary`). [`config/hyprland/altium.lua`](../config/hyprland/altium.lua) does this when
+Hyprland starts and whenever a monitor is added, for the first monitor that is not built in
+(or the one named in `altium_primary`); XWayland adds a monitor's output a moment after
+Hyprland reports it, so the command retries for 10 seconds. Wine reads the primary when the
+bottle starts, puts the external monitor at Windows (0,0), and Altium's splash, centred
+dialogs, main window and floating panels open there. As long as you work on that monitor,
+every window Altium opens or moves stays on the focused monitor, where Hyprland's conversion
+is right.
+
+With the fix, all five splash windows were on the external monitor, each at its X11
+position minus 960 (centre 2901,633, right shadow 3221 = 2901 + 320, bottom 867 = 633 + 234),
+the main window at 1931,30, and the Messages panel on the external monitor.
+
+Side effects of moving Windows (0,0):
+
+- Window sizes and positions that Altium saves as percentages follow the primary monitor.
+  A size saved while the bug was active stays wrong: here the Messages frame had been saved
+  at 97% by 94% of the screen (`'-2.60, 23.06, 94.44, 117.06'`). Resize the panel once;
+  Altium saves the new size when it exits.
+- Dialog positions saved in pixels (registry, `DesignExplorer\Forms\<form class>`, `Left`
+  and `Top`) are now relative to the external monitor. Those that were on the external
+  monitor point past its right edge; subtract the laptop's width (in X11 pixels) from
+  `Left` once. Here that was the Design Rule Check dialog (3778) and the menu that picks one
+  of several objects under the cursor (4093).
+- Other X11 programs also treat the external monitor as primary.
+
+Not fixed: starting Altium while the laptop has the focus, and moving Altium windows onto
+the laptop, still go through Hyprland's two code paths (see
+[known-issues.md](known-issues.md#windows-misplaced-on-the-other-monitor-mixed-scaling)).
