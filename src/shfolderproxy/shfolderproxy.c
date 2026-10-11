@@ -4,8 +4,8 @@
  * X2.EXE imports SHFolder.dll at startup, so a copy of this DLL placed next to
  * X2.EXE is loaded early. Its exports forward to shell32 like Wine's own
  * shfolder. On load it works around six Wine gaps, in X2.EXE and in every DLL
- * loaded later (via LdrRegisterDllNotification), and one VCL bug that shows up
- * under Wine (7):
+ * loaded later (via LdrRegisterDllNotification), one VCL bug that shows up
+ * under Wine (7), and a Wine-on-DXVK slowdown (8):
  *
  * 1. Missing user32 functions. Altium delay-loads a few newer user32 functions
  *    that Wine does not export (InheritWindowMonitor is still a stub in upstream
@@ -72,6 +72,13 @@
  *    replaced: for a control that is in no form any more, the form's stale pointers are
  *    cleared, as VCL does when a control is removed, instead of creating a window.
  *
+ * 8. Slow schematic redraws. Wine's d2d1 swaps its own Direct3D state into the context
+ *    before every shape it draws and the application's back after it, and in DXVK each swap
+ *    copies and rebinds the whole context state. Once d2d1 has created a render target, the
+ *    swap back and the next swap in are skipped while nothing else uses the context; the
+ *    application's state goes back before any other caller uses the context, and at
+ *    EndDraw. ALTIUM_KEEP_D2D_SWAPS=1 turns this off.
+ *
  * Build: scripts/build.sh (clang + lld-link + llvm-dlltool; no Windows SDK or CRT needed).
  */
 
@@ -96,6 +103,8 @@ IMPORT HANDLE CreateThread(void *attrs, SIZE_T stack, DWORD (*start)(void *), vo
 IMPORT NTSTATUS LdrRegisterDllNotification(DWORD flags, void *callback, void *context, void **cookie);
 IMPORT HANDLE GetCurrentProcess(void);
 IMPORT BOOL FlushInstructionCache(HANDLE process, const void *addr, SIZE_T size);
+IMPORT DWORD GetCurrentThreadId(void);
+IMPORT DWORD GetEnvironmentVariableA(const char *name, char *value, DWORD size);
 
 #define PAGE_READWRITE 0x04
 #define PAGE_EXECUTE_READWRITE 0x40
@@ -1013,33 +1022,6 @@ static int add_arc_missing(void *path, void *sink)
             && bounds.right == box[1].x;
 }
 
-/* On its own thread, like patch_dwrite: d2d1 cannot be used from the load notification. */
-static DWORD patch_d2d1(void *module)
-{
-    d2d_create_factory_fn create = (d2d_create_factory_fn)GetProcAddress(module, "D2D1CreateFactory");
-    void *factory = 0, *path = 0, *sink = 0;
-
-    if (!create || create(0 /* SINGLE_THREADED */, &IID_ID2D1Factory, 0, &factory) < 0) return 1;
-    /* The sink's vtable is shared by every path geometry. */
-    if (((create_fn)VTBL(factory)[SLOT_D2D_FACTORY_CREATE_PATH_GEOMETRY])(factory, &path) >= 0
-            && ((create_fn)VTBL(path)[SLOT_PATH_GEOMETRY_OPEN])(path, &sink) >= 0
-            && add_arc_missing(path, sink))
-        wrap_slot(module, &VTBL(sink)[SLOT_SINK_ADD_ARC], (void *)add_arc_hook, (void **)&real_add_arc);
-
-    release(sink);
-    release(path);
-    release(factory);
-    if (real_add_arc) OutputDebugStringA("shfolderproxy: Direct2D arc hook installed in d2d1.dll\n");
-    return 0;
-}
-
-static void d2d1_loaded(BYTE *base)
-{
-    static volatile long started;
-    if (!is_wine_builtin(base) || __sync_lock_test_and_set(&started, 1)) return;
-    CreateThread(0, 0, patch_d2d1, base, 0, 0);
-}
-
 /* ---- 7. Stale ActiveControl of a panel form ------------------------------- */
 
 /* VCL's DoNestedActivation (Vcl.Forms), as compiled into X2.EXE (Delphi 12, x64), followed by
@@ -1171,6 +1153,335 @@ static void patch_nested_activation(BYTE *exe)
     VirtualProtect(code, sizeof(jump), old, &old);
     FlushInstructionCache(GetCurrentProcess(), code, sizeof(jump));
     OutputDebugStringA("shfolderproxy: VCL DoNestedActivation replaced in X2.EXE\n");
+}
+
+/* ---- 8. Direct3D state swaps around every Direct2D draw -------------------- */
+
+/* Wine's d2d1 draws every shape (each line, fill and glyph bitmap of a schematic) in
+ * d2d_device_context_draw: it swaps its own Direct3D state object into the immediate context
+ * (ID3D11DeviceContext1::SwapDeviceContextState), sets its shaders and buffers, draws, and
+ * swaps the application's state back. In DXVK a swap copies the whole context state, with a
+ * reference count change for every slot, and binds all of it again: about half of the
+ * schematic editor's redraw time.
+ *
+ * Swapping the application's state back and d2d1's in again changes nothing if nothing else
+ * uses the context in between. So the swap back is held back (the application's state object
+ * is kept, with a reference), and d2d1's next swap to the same state of its own is skipped:
+ * d2d1 gets the held state as the previous one. The held state goes into the context before
+ * any other caller uses the context (every method of the immediate context goes through a
+ * thunk that checks, below), and at the end of d2d1's EndDraw and Flush, on the thread that
+ * drew. d2d1's own calls between draws (Map and Unmap of its constant buffers, bitmap
+ * uploads) and DXVK's calls to itself do not depend on the bound state and pass through.
+ *
+ * Installed when d2d1 creates its first render target on a DXGI surface (as the schematic
+ * editor does): the context's vtable is shared by every immediate context of that
+ * d3d11.dll. ALTIUM_KEEP_D2D_SWAPS=1 leaves it out. */
+
+#define SLOT_ADDREF 1
+#define SLOT_D2D_FACTORY_CREATE_DXGI_SURFACE_RENDER_TARGET 15
+#define SLOT_RENDER_TARGET_FLUSH 42
+#define SLOT_RENDER_TARGET_END_DRAW 49
+#define SLOT_DXGI_SURFACE_GET_DEVICE 7
+#define SLOT_D3D11_DEVICE_GET_IMMEDIATE_CONTEXT 40
+#define SLOT_CONTEXT_SWAP_DEVICE_CONTEXT_STATE 131
+#define CONTEXT_SLOTS 149 /* ID3D11DeviceContext4 */
+#define SWAP_CONTEXTS_MAX 16
+
+static const GUID IID_ID3D11Device = { 0xdb6f6ddb, 0xac77, 0x4e88, { 0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40 } };
+
+typedef void (*swap_state_fn)(void *context, void *state, void **previous);
+typedef HRESULT (*create_dxgi_rt_fn)(void *factory, void *surface, const void *desc, void **rt);
+typedef HRESULT (*end_draw_fn)(void *rt, ULONGLONG *tag1, ULONGLONG *tag2);
+typedef HRESULT (*get_device_fn)(void *obj, const GUID *iid, void **device);
+typedef void (*get_context_fn)(void *device, void **context);
+typedef DWORD (*addref_fn)(void *obj);
+
+struct swap_context {
+    void *context;   /* NULL: free */
+    void *app_state; /* swapped back by d2d1, not yet into the context; one reference held */
+    void *d2d_state; /* d2d1's state, in the context */
+    DWORD thread;    /* the thread that held app_state back */
+};
+
+static struct swap_context swap_contexts[SWAP_CONTEXTS_MAX];
+static volatile long swap_contexts_lock;
+static const BYTE *d3d11_module;
+static create_dxgi_rt_fn real_create_dxgi_rt;
+static end_draw_fn real_end_draw, real_flush;
+
+/* Read by the thunks. */
+volatile long d2d_swaps_pending; /* held application states, all contexts */
+void *d3d_context_real[CONTEXT_SLOTS];
+
+static void lock_swap_contexts(void) { while (__sync_lock_test_and_set(&swap_contexts_lock, 1)) ; }
+static void unlock_swap_contexts(void) { __sync_lock_release(&swap_contexts_lock); }
+
+/* With the lock held. A full table gives up an entry holding nothing back. */
+static struct swap_context *find_swap_context(void *context, int create)
+{
+    struct swap_context *spare = 0;
+    for (int i = 0; i < SWAP_CONTEXTS_MAX; i++) {
+        struct swap_context *c = &swap_contexts[i];
+        if (c->context == context) return c;
+        if (!c->app_state && (!spare || (spare->context && !c->context))) spare = c; /* prefer a free one */
+    }
+    if (!create || !spare) return 0;
+    spare->context = context;
+    spare->d2d_state = 0;
+    return spare;
+}
+
+static void swap_state(void *context, void *state, void **previous)
+{
+    ((swap_state_fn)d3d_context_real[SLOT_CONTEXT_SWAP_DEVICE_CONTEXT_STATE])(context, state, previous);
+}
+
+/* Put the held application state into the context, as d2d1 would have done after its last
+ * draw, and forget which state d2d1 left in it. */
+static void restore_app_state(void *context)
+{
+    struct swap_context *c;
+    void *held = 0;
+
+    lock_swap_contexts();
+    if ((c = find_swap_context(context, 0))) {
+        if ((held = c->app_state)) d2d_swaps_pending--;
+        c->app_state = c->d2d_state = 0;
+    }
+    unlock_swap_contexts();
+    if (held) {
+        swap_state(context, held, 0);
+        release(held);
+    }
+}
+
+static void restore_thread_app_states(void)
+{
+    struct { void *context, *state; } held[SWAP_CONTEXTS_MAX];
+    unsigned count = 0;
+    DWORD thread;
+
+    if (!d2d_swaps_pending) return;
+    thread = GetCurrentThreadId();
+    lock_swap_contexts();
+    for (int i = 0; i < SWAP_CONTEXTS_MAX; i++) {
+        struct swap_context *c = &swap_contexts[i];
+        if (!c->app_state || c->thread != thread) continue;
+        held[count].context = c->context;
+        held[count++].state = c->app_state;
+        c->app_state = c->d2d_state = 0;
+        d2d_swaps_pending--;
+    }
+    unlock_swap_contexts();
+    for (unsigned i = 0; i < count; i++) {
+        swap_state(held[i].context, held[i].state, 0);
+        release(held[i].state);
+    }
+}
+
+/* Called by the thunks before a context method runs, while some state is held back. */
+void d3d_context_called(void *context, const void *caller)
+{
+    if (!from_wine_d2d1(caller) && !in_image(d3d11_module, caller)) restore_app_state(context);
+}
+
+static void swap_state_hook(void *context, void *state, void **previous)
+{
+    const void *caller = __builtin_return_address(0);
+    struct swap_context *c;
+    void *held;
+
+    if (!state || !from_wine_d2d1(caller)) { /* whoever swaps, the held state goes in first */
+        restore_app_state(context);
+        swap_state(context, state, previous);
+        return;
+    }
+    lock_swap_contexts();
+    c = find_swap_context(context, 1);
+    if (previous) { /* d2d1 swaps its state in before a draw */
+        if (c && c->app_state && c->d2d_state == state) {
+            *previous = c->app_state; /* with the reference held, which d2d1 releases */
+            c->app_state = 0;
+            d2d_swaps_pending--;
+            unlock_swap_contexts();
+            return;
+        }
+        held = c ? c->app_state : 0;
+        if (held) d2d_swaps_pending--;
+        if (c) {
+            c->app_state = 0;
+            c->d2d_state = state;
+        }
+        unlock_swap_contexts();
+        if (held) {
+            swap_state(context, held, 0);
+            release(held);
+        }
+        swap_state(context, state, previous);
+        return;
+    }
+    /* d2d1 swaps the application's state back after a draw */
+    if (c && c->d2d_state && !c->app_state) {
+        ((addref_fn)VTBL(state)[SLOT_ADDREF])(state);
+        c->app_state = state;
+        c->thread = GetCurrentThreadId();
+        d2d_swaps_pending++;
+        unlock_swap_contexts();
+        return;
+    }
+    if (c) c->d2d_state = 0;
+    unlock_swap_contexts();
+    swap_state(context, state, 0);
+}
+
+static HRESULT end_draw_hook(void *rt, ULONGLONG *tag1, ULONGLONG *tag2)
+{
+    HRESULT hr = real_end_draw(rt, tag1, tag2);
+    restore_thread_app_states();
+    return hr;
+}
+
+static HRESULT flush_hook(void *rt, ULONGLONG *tag1, ULONGLONG *tag2)
+{
+    HRESULT hr = real_flush(rt, tag1, tag2);
+    restore_thread_app_states();
+    return hr;
+}
+
+/* One thunk per slot of the context's vtable: straight to the real method while nothing is
+ * held back, otherwise through d3d_context_called first, with the arguments kept (rcx, rdx,
+ * r8, r9, xmm0-3; the rest are on the stack, untouched). */
+#define CONTEXT_THUNK(n) __asm__(                                         \
+    ".text\n"                                                             \
+    "d3d_context_thunk_" #n ":\n"                                         \
+    "    cmpl $0, d2d_swaps_pending(%rip)\n"                              \
+    "    jne 1f\n"                                                        \
+    "    jmpq *d3d_context_real+8*" #n "(%rip)\n"                         \
+    "1:  movl $" #n ", %eax\n"                                            \
+    "    jmp d3d_context_thunk_slow\n");
+#define DECLARE_CONTEXT_THUNK(n) void d3d_context_thunk_##n(void);
+#define CONTEXT_THUNK_ADDRESS(n) (void *)d3d_context_thunk_##n,
+#define TEN_SLOTS(X, t) X(t##0) X(t##1) X(t##2) X(t##3) X(t##4) X(t##5) X(t##6) X(t##7) X(t##8) X(t##9)
+#define CONTEXT_SLOT_LIST(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9)                     \
+    TEN_SLOTS(X, 1) TEN_SLOTS(X, 2) TEN_SLOTS(X, 3) TEN_SLOTS(X, 4) TEN_SLOTS(X, 5) TEN_SLOTS(X, 6) \
+    TEN_SLOTS(X, 7) TEN_SLOTS(X, 8) TEN_SLOTS(X, 9) TEN_SLOTS(X, 10) TEN_SLOTS(X, 11)               \
+    TEN_SLOTS(X, 12) TEN_SLOTS(X, 13) X(140) X(141) X(142) X(143) X(144) X(145) X(146) X(147) X(148)
+
+CONTEXT_SLOT_LIST(CONTEXT_THUNK)
+CONTEXT_SLOT_LIST(DECLARE_CONTEXT_THUNK)
+static void *const d3d_context_thunks[CONTEXT_SLOTS] = { CONTEXT_SLOT_LIST(CONTEXT_THUNK_ADDRESS) };
+
+/* eax = the slot. Saves the argument registers, calls d3d_context_called(context, the
+ * caller's return address) and jumps to the real method. */
+__asm__(
+    ".text\n"
+    ".seh_proc d3d_context_thunk_slow\n"
+    "d3d_context_thunk_slow:\n"
+    "    pushq %rcx\n"
+    "    .seh_pushreg %rcx\n"
+    "    pushq %rdx\n"
+    "    .seh_pushreg %rdx\n"
+    "    pushq %r8\n"
+    "    .seh_pushreg %r8\n"
+    "    pushq %r9\n"
+    "    .seh_pushreg %r9\n"
+    "    subq $0x68, %rsp\n"
+    "    .seh_stackalloc 0x68\n"
+    "    .seh_endprologue\n"
+    "    movdqu %xmm0, 0x20(%rsp)\n"
+    "    movdqu %xmm1, 0x30(%rsp)\n"
+    "    movdqu %xmm2, 0x40(%rsp)\n"
+    "    movdqu %xmm3, 0x50(%rsp)\n"
+    "    movl %eax, 0x60(%rsp)\n"
+    "    movq 0x88(%rsp), %rdx\n" /* return address, above the 4 pushes and 0x68 bytes */
+    "    callq d3d_context_called\n"
+    "    movl 0x60(%rsp), %eax\n"
+    "    movdqu 0x20(%rsp), %xmm0\n"
+    "    movdqu 0x30(%rsp), %xmm1\n"
+    "    movdqu 0x40(%rsp), %xmm2\n"
+    "    movdqu 0x50(%rsp), %xmm3\n"
+    "    addq $0x68, %rsp\n"
+    "    popq %r9\n"
+    "    popq %r8\n"
+    "    popq %rdx\n"
+    "    popq %rcx\n"
+    "    leaq d3d_context_real(%rip), %r11\n"
+    "    jmpq *(%r11,%rax,8)\n"
+    ".seh_endproc\n");
+
+/* Point every slot but IUnknown's at its thunk, and SwapDeviceContextState at the hook. */
+static void install_swap_hooks(void *surface, void *rt)
+{
+    static volatile long tried;
+    const BYTE *d2d1 = GetModuleHandleW(L"d2d1.dll");
+    void *device = 0, *context = 0;
+    volatile ULONGLONG *vtbl;
+    DWORD old;
+    char keep[4];
+
+    if (__sync_lock_test_and_set(&tried, 1)) return;
+    if (GetEnvironmentVariableA("ALTIUM_KEEP_D2D_SWAPS", keep, sizeof(keep)) == 1 && keep[0] == '1') return;
+    if (((get_device_fn)VTBL(surface)[SLOT_DXGI_SURFACE_GET_DEVICE])(surface, &IID_ID3D11Device, &device) < 0) return;
+    ((get_context_fn)VTBL(device)[SLOT_D3D11_DEVICE_GET_IMMEDIATE_CONTEXT])(device, &context);
+    release(device);
+    if (!context) return;
+    vtbl = (volatile ULONGLONG *)VTBL(context);
+    d3d11_module = GetModuleHandleW(L"d3d11.dll");
+    for (int i = 0; i < CONTEXT_SLOTS; i++)
+        if (!in_image(d3d11_module, (void *)vtbl[i])) goto done; /* not d3d11.dll's immediate context */
+    for (int i = 0; i < CONTEXT_SLOTS; i++) d3d_context_real[i] = (void *)vtbl[i];
+
+    wrap_slot(d2d1, &VTBL(rt)[SLOT_RENDER_TARGET_END_DRAW], (void *)end_draw_hook, (void **)&real_end_draw);
+    wrap_slot(d2d1, &VTBL(rt)[SLOT_RENDER_TARGET_FLUSH], (void *)flush_hook, (void **)&real_flush);
+    if (!real_end_draw || !real_flush) goto done;
+
+    __sync_synchronize(); /* the real methods are visible before the slots change */
+    if (!VirtualProtect((void *)vtbl, CONTEXT_SLOTS * sizeof(*vtbl), PAGE_READWRITE, &old)) goto done;
+    for (int i = SLOT_ADDREF + 2; i < CONTEXT_SLOTS; i++)
+        vtbl[i] = (ULONGLONG)(i == SLOT_CONTEXT_SWAP_DEVICE_CONTEXT_STATE ? (void *)swap_state_hook : d3d_context_thunks[i]);
+    VirtualProtect((void *)vtbl, CONTEXT_SLOTS * sizeof(*vtbl), old, &old);
+    OutputDebugStringA("shfolderproxy: Direct2D state-swap hooks installed in d3d11.dll\n");
+done:
+    release(context);
+}
+
+static HRESULT create_dxgi_rt_hook(void *factory, void *surface, const void *desc, void **rt)
+{
+    HRESULT hr = real_create_dxgi_rt(factory, surface, desc, rt);
+    if (hr >= 0 && surface && rt && *rt) install_swap_hooks(surface, *rt);
+    return hr;
+}
+
+/* ---- Hooks in Wine's d2d1.dll (6 and 8) ------------------------------------ */
+
+/* On its own thread, like patch_dwrite: d2d1 cannot be used from the load notification. The
+ * factory's vtable is shared by every factory. */
+static DWORD patch_d2d1(void *module)
+{
+    d2d_create_factory_fn create = (d2d_create_factory_fn)GetProcAddress(module, "D2D1CreateFactory");
+    void *factory = 0, *path = 0, *sink = 0;
+
+    if (!create || create(0 /* SINGLE_THREADED */, &IID_ID2D1Factory, 0, &factory) < 0) return 1;
+    /* The sink's vtable is shared by every path geometry. */
+    if (((create_fn)VTBL(factory)[SLOT_D2D_FACTORY_CREATE_PATH_GEOMETRY])(factory, &path) >= 0
+            && ((create_fn)VTBL(path)[SLOT_PATH_GEOMETRY_OPEN])(path, &sink) >= 0
+            && add_arc_missing(path, sink))
+        wrap_slot(module, &VTBL(sink)[SLOT_SINK_ADD_ARC], (void *)add_arc_hook, (void **)&real_add_arc);
+    wrap_slot(module, &VTBL(factory)[SLOT_D2D_FACTORY_CREATE_DXGI_SURFACE_RENDER_TARGET],
+              (void *)create_dxgi_rt_hook, (void **)&real_create_dxgi_rt);
+
+    release(sink);
+    release(path);
+    release(factory);
+    if (real_add_arc) OutputDebugStringA("shfolderproxy: Direct2D arc hook installed in d2d1.dll\n");
+    return 0;
+}
+
+static void d2d1_loaded(BYTE *base)
+{
+    static volatile long started;
+    if (!is_wine_builtin(base) || __sync_lock_test_and_set(&started, 1)) return;
+    CreateThread(0, 0, patch_d2d1, base, 0, 0);
 }
 
 /* ---- Import table patching ---------------------------------------------- */

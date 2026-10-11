@@ -125,7 +125,19 @@ sign-in step and installed normally; sign in afterwards from Altium.
   the bottle after Altium closes (`pgrep -af 'msedgewebview2|explorer.exe'`), end them
   before starting it again.
 - **Starting from Bottles once hung** at about 110 MB with no window; the process was gone
-  before it could be inspected. A second start worked.
+  before it could be inspected. A second start worked. A start from `debug-launch.sh` hung
+  the same way on 2026-10-11, 0.2 s after the proxy loaded: the main thread (in
+  `LoadLibrary`, called from user32) held a lock in Altium's own `ucrtbase.dll` and waited
+  for Wine's loader lock, held by a thread that was starting (thread attach) and waited for
+  that `ucrtbase.dll` lock. Wine logs `RtlpWaitForCriticalSection ... loader_section wait
+  timed out` every 5 s. Which thread it was is not known; the proxy starts one when
+  `dwrite.dll` loads (item 3). End it with `wineserver -k` and start again.
+- **Crash on the first schematic frame, once.** With the Direct2D state-swap hook
+  (how-it-works §18), one session in 17 ended with an access violation in DXVK's memory
+  allocator under `CreateBuffer`, called from d2d1, on the first frame of the schematic
+  (.NET reports `System.AccessViolationException` in `RenderTarget.DrawLine`). Not seen in
+  any other session, with or without the hook; the cause is not known. If it happens again,
+  `ALTIUM_KEEP_D2D_SWAPS=1` (a bottle environment variable) turns the hook off.
 - **The embedded WebView2 sign-in** never renders; browser sign-in replaces it. The
   WebView2 Home page does render.
 - **A newer runner may fix some of this and break other things:** upstream Wine has

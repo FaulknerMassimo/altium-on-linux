@@ -27,6 +27,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 15 | Schematic symbols drawn with arcs (inductors) blank | Wine's d2d1 does not implement `ID2D1GeometrySink::AddArc` | `SHFolder.dll` proxy (Direct2D arcs) |
 | 16 | Error dialog `Control 'View…' has no parent window`, now and then | a panel form keeps a removed view as its active control; VCL creates a window for it on the next focus change | `SHFolder.dll` proxy (VCL `DoNestedActivation`) |
 | 17 | With two monitors: splash split across them, Messages panel on the other screen, too big | Hyprland misplaces X11 windows that open or move on a monitor other than the focused one when the monitors' scales differ; Wine's primary monitor is the laptop | external monitor made X11's primary (Hyprland hook) |
+| 18 | Schematic redraws slow (24 a second on a 346 KB sheet) | Wine's d2d1 swaps the whole Direct3D context state twice per shape, and DXVK copies and rebinds it every time | `SHFolder.dll` proxy skips the swaps while nothing else uses the context |
 
 ## 1. ICU error in the installer
 
@@ -638,3 +639,61 @@ Side effects of moving Windows (0,0):
 Not fixed: starting Altium while the laptop has the focus, and moving Altium windows onto
 the laptop, still go through Hyprland's two code paths (see
 [known-issues.md](known-issues.md#windows-misplaced-on-the-other-monitor-mixed-scaling)).
+
+## 18. Slow schematic redraws (a Direct3D state swap per shape)
+
+With the views no longer capped (§11), the PCB view redrew more than 200 times a second
+but the schematic only 24 (posting wheel steps faster than it redraws, see debugging.md),
+on a 346 KB sheet. Altium's UI thread was busy the whole time, about 41 ms a frame, and
+DXVK's command thread (`dxvk-cs`) about 20 ms.
+
+`scripts/profile.py` on the UI thread: 82% of the samples were in DXVK's `d3d11.dll`,
+called from Wine's `d2d1.dll`, and only 6% in d2d1 itself and 6% in FreeType. Three
+quarters of the DXVK samples were in one function: a loop over every shader resource slot
+of every stage, with an atomic reference count change for each, which is DXVK copying a
+`D3D11ContextState`. That copy is `ID3D11DeviceContext1::SwapDeviceContextState`
+(`D3D11ImmediateContext::SwapDeviceContextState` in DXVK 3.1: `oldState->SetState(m_state)`,
+`newState->GetState(m_state)`, then all state unbound and bound again).
+
+Wine's d2d1 calls it twice for every shape it draws (`d2d_device_context_draw` in
+`dlls/d2d1/device.c`): it swaps its own state object in, sets its input layout, shaders,
+buffers, viewport, scissor, blend state and render target, draws, and swaps the
+application's state back. A schematic frame is thousands of shapes (every line, fill and
+glyph run). Every other call d2d1 makes on the context (`Map`/`Unmap` of its constant
+buffers, bitmap uploads) is independent of the bound state, and Altium's schematic painter
+(`Altium.GeometryMaker.Direct2DGraphics`) never uses the Direct3D 11 context itself: it
+creates the device, hands it to `D2D1CreateDevice` and draws through
+`CreateDxgiSurfaceRenderTarget`.
+
+**Fix:** in the `SHFolder.dll` proxy (item 8). When d2d1 swaps the application's state
+back after a shape, the swap is held back: the proxy keeps the state object, with a
+reference. When d2d1 then swaps its own state in for the next shape, and it is the state
+still in the context, nothing is swapped and d2d1 gets the held state as the previous one.
+The held state goes into the context at the end of d2d1's `EndDraw` and `Flush`, and before
+anyone other than d2d1 or DXVK itself calls a method of the context: every slot of the
+immediate context's vtable (shared by all of DXVK's immediate contexts) is pointed at a
+thunk that checks first, and costs a compare and a jump while nothing is held. The hooks
+go in when d2d1 creates its first render target on a DXGI surface (the factory's
+`CreateDxgiSurfaceRenderTarget` is wrapped; the factory's vtable is shared, like the arc
+hook's in §15). `ALTIUM_KEEP_D2D_SWAPS=1` leaves them out.
+
+Measured as in §11, same sheet, fresh sessions:
+
+| | UI thread per frame | schematic redraws/s |
+|---|---|---|
+| Wine's swaps | 41 ms | 24 |
+| swaps skipped | 19 ms | 51 to 55 (16 sessions) |
+
+A frame captured through X11 is identical to one drawn with the swaps (0 pixels differ at
+a 2% tolerance), the down-down-up scroll test of §11 gives the right frame, and the PCB
+view, whose context also goes through the thunks once a schematic has been opened, still
+redraws about 230 times a second.
+
+What is left of the schematic's frame time: DXVK creating two buffers for every shape
+(d2d1 makes a new vertex and index buffer per draw), Wine's heap, FreeType hinting glyphs
+again, and d2d1's own code.
+
+One session out of 17 with this hook crashed on its first schematic frame, in DXVK's
+memory allocator under `ID3D11Device::CreateBuffer` called from d2d1 (a corrupted free
+list). It did not happen again in 16 sessions; the cause is not known. See
+[known-issues.md](known-issues.md#smaller-things).

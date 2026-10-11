@@ -40,6 +40,7 @@ completion only (its first version), and `ALTIUM_PRESENT_WAIT_DEBUG=1` makes it 
 wait (`altium-present-wait: present 31 at 223188.866608 s: waited 0.73 ms, ended by damage
 (swapchain 0x5555..., present 0, wait 2)`, the time being `CLOCK_MONOTONIC`).
 `grep VkLayer /proc/<pid>/maps` shows whether the layer is loaded.
+`ALTIUM_KEEP_D2D_SWAPS=1` leaves out the proxy's Direct2D state-swap hook (how-it-works §18).
 
 To measure a view's redraw rate, start Altium with `ALTIUM_PRESENT_WAIT_DEBUG=1`, post
 wheel steps to the view faster than it redraws (two `postmsg.exe` runs at once, one

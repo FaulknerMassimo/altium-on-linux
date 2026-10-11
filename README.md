@@ -21,7 +21,7 @@ redistributed here.
 | Home page, menus, Preferences | work |
 | PCB editor, 2D and 3D | works |
 | Schematic editor | opens and redraws; text ([§12](docs/how-it-works.md#12-schematic-text-broken-and-redraws-slow-direct2d-text)) and symbols drawn with arcs, such as inductors ([§15](docs/how-it-works.md#15-blank-schematic-symbols-inductors-direct2d-arcs)), fixed; editing works |
-| PCB and schematic views showing the previous frame | fixed ([§11](docs/how-it-works.md#11-pcb-and-schematic-views-one-frame-behind-vulkan-present-race)), without capping the PCB view's redraw rate (over 200 redraws/s); the schematic redraws about 24 times a second on a large sheet, limited by Wine's Direct2D |
+| PCB and schematic views showing the previous frame | fixed ([§11](docs/how-it-works.md#11-pcb-and-schematic-views-one-frame-behind-vulkan-present-race)), without capping the PCB view's redraw rate (over 200 redraws/s); the schematic redraws about 50 times a second on a large sheet ([§18](docs/how-it-works.md#18-slow-schematic-redraws-a-direct3d-state-swap-per-shape)) |
 | Heads-up display in the PCB view | fixed ([§14](docs/how-it-works.md#14-heads-up-display-frozen-in-the-pcb-view-layered-child-windows)); drawn over black rather than blended with the board |
 | Two monitors with different scaling | Altium's windows open on the external monitor ([§17](docs/how-it-works.md#17-windows-split-across-monitors-hyprland-mixed-scaling)); moving them to the laptop screen, or starting Altium from it, still misplaces them ([known issues](docs/known-issues.md#windows-misplaced-on-the-other-monitor-mixed-scaling)) |
 | Loading a project | occasionally freezes (seen three times); can be unfrozen without a restart ([known issues](docs/known-issues.md#intermittent-freeze-while-a-project-loads)) |
@@ -63,6 +63,7 @@ Hyprland rules only matter on Hyprland.
 | 15 | Schematic symbols drawn with arcs (inductors) blank | `SHFolder.dll` proxy implements Direct2D arcs |
 | 16 | Error dialog `Control 'View…' has no parent window`, now and then | `SHFolder.dll` proxy clears a panel's stale focus pointer instead of creating a window for it |
 | 17 | Two monitors at different scales (Hyprland): splash split across them, Messages panel on the other screen | external monitor made X11's primary, so Wine and Altium put their windows there |
+| 18 | Schematic redraws slow (24 a second on a large sheet) | `SHFolder.dll` proxy skips Wine's Direct3D state swaps around every Direct2D shape |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.

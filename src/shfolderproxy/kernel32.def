@@ -8,3 +8,5 @@ OutputDebugStringA
 CreateThread
 GetCurrentProcess
 FlushInstructionCache
+GetCurrentThreadId
+GetEnvironmentVariableA
