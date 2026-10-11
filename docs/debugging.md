@@ -35,9 +35,17 @@ scripts/debug-launch.sh --debug fixme-all,warn+seh,+timestamp,+loaddll \
 
 `--env NAME=VALUE` (repeatable) adds a variable after the bottle's own, for A/B runs:
 `DISABLE_ALTIUM_PRESENT_WAIT=1` starts Altium without the present-wait layer
-(how-it-works §11), `ALTIUM_PRESENT_WAIT_DEBUG=1` makes the layer log every wait
-(`altium-present-wait: present 31: waited 19.17 ms`). `grep VkLayer /proc/<pid>/maps`
-shows whether the layer is loaded.
+(how-it-works §11), `ALTIUM_PRESENT_WAIT_NO_DAMAGE=1` makes it wait for present
+completion only (its first version), and `ALTIUM_PRESENT_WAIT_DEBUG=1` makes it log every
+wait (`altium-present-wait: present 31 at 223188.866608 s: waited 0.73 ms, ended by damage
+(swapchain 0x5555..., present 0, wait 2)`, the time being `CLOCK_MONOTONIC`).
+`grep VkLayer /proc/<pid>/maps` shows whether the layer is loaded.
+
+To measure a view's redraw rate, start Altium with `ALTIUM_PRESENT_WAIT_DEBUG=1`, post
+wheel steps to the view faster than it redraws (two `postmsg.exe` runs at once, one
+scrolling down and one up, 150 steps each 4 ms apart, so the view ends where it started)
+and wait until no present has been logged for 2 s. Every step is one redraw; the number of
+presents over the time between the first and the last is the rate.
 
 Useful `WINEDEBUG` channels:
 

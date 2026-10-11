@@ -57,7 +57,8 @@ link_exe clearex start_entry "$SRC/tools/clearex.c" "$SRC/tools/user32.def" "$SR
 link_exe postmsg start_entry "$SRC/tools/postmsg.c" "$SRC/tools/user32.def" "$SRC/tools/kernel32.def"
 
 # Loaded by the host Vulkan loader inside the Bottles Flatpak, whose glibc can be older
-# than the host's: no fortify wrappers or stack protector, so only old symbols are used.
+# than the host's: no fortify wrappers or stack protector, so only old symbols are used
+# (the newest is dlopen, glibc 2.34; Bottles' GNOME 49 runtime has 2.42).
 clang -shared -fPIC -O2 -fvisibility=hidden -fno-stack-protector -U_FORTIFY_SOURCE -Wall -Wextra -Werror \
     -o "$OUT/VkLayer_altium_present_wait.so" "$SRC/presentwait/presentwait.c"
 

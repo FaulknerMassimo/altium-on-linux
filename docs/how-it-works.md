@@ -20,7 +20,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 8 | Whole UI in Times New Roman | no Segoe UI | Selawik renamed to "Segoe UI" |
 | 9 | File menu / right-click: `External exception C06D007F` | `user32!InheritWindowMonitor` missing in Wine | `SHFolder.dll` proxy |
 | 10 | Opening a PCB kills Altium (`GnuTLS error: Decryption has failed`) | Wine's GnuTLS `bcrypt` ignores `BCRYPT_PAD_NONE` | `SHFolder.dll` proxy (raw RSA) |
-| 11 | PCB and schematic views one frame behind (a selection shows up only with the next redraw) | Wine copies an off-screen child window before Mesa's X11 present has updated it | Vulkan layer that waits for each present to complete |
+| 11 | PCB and schematic views one frame behind (a selection shows up only with the next redraw) | Wine copies an off-screen child window before Mesa's X11 present has updated it | Vulkan layer that waits until the X server has copied each present (DAMAGE) |
 | 12 | Schematic text with missing strokes, slow schematic redraws | Wine's d2d1 picks the text rendering mode without the zoom transform, fills glyph outlines unantialiased | `SHFolder.dll` proxy (DirectWrite hooks) |
 | 13 | Black box around part of the splash screen | Wine cuts transparent pixels out with an X shape and never paints them; Hyprland ignores X shapes | `SHFolder.dll` proxy (layered windows) |
 | 14 | PCB heads-up display frozen in the view, a live copy in the corner of the screen on every workspace | Wine gives a layered child window its own top-level X window | `SHFolder.dll` proxy (layered child windows) |
@@ -265,26 +265,55 @@ Routing Direct3D 11 through WineD3D (OpenGL) instead of DXVK did not help and wa
 
 **Fix:** [`src/presentwait`](../src/presentwait/presentwait.c), a Vulkan layer loaded by
 the host Vulkan loader (on the Linux side, inside the Bottles sandbox), between Wine and
-Mesa. After `vkQueuePresentKHR` it calls `vkWaitForPresentKHR` with the present ID that
-DXVK attaches to every present (DXVK enables `VK_KHR_present_id` and
-`VK_KHR_present_wait` when the driver has them, as Mesa does). It returns once the X
-server reports the present complete, and Wine then copies the new frame. Presents without
-an ID, and devices without present wait, pass through unchanged. A wait gives up after
-100 ms.
+Mesa. After `vkQueuePresentKHR` it waits until the X server has copied the image into the
+off-screen window, and Wine then copies the new frame.
 
-Each present waits about 19 ms. Xwayland does the copy at once but reports it complete on
-its next tick (`xwl_present_execute` queues the completion for `crtc_msc + 1`; the tick is
-a 17 ms timer for windows it does not show itself). DXVK presents from its own thread, so
-Altium's UI thread does not block, but a view now redraws at most about 50 times a
-second. `dxvk.conf` stays: in FIFO mode Xwayland would also delay the copy itself to a
-tick, making each wait up to a tick longer.
+The copy shows up as damage to that window. For every swapchain the layer opens its own X
+connection (`libxcb`, `libxcb-damage`) and creates a DAMAGE object on the swapchain's
+window, which it learns from `vkCreateXlibSurfaceKHR`. Xwayland reports the damage when it
+executes the copy: as soon as it handles `PresentPixmap`, or, with explicit sync, once the
+image's acquire fence has signalled. Before each present the layer makes a round trip on
+its connection and drops the damage reported so far; after it, it waits for new damage.
+Wine's copy is sent after the layer returns, so the X server handles it after its own copy.
+
+The first version waited for the present to complete instead (`vkWaitForPresentKHR`, with
+the present ID DXVK attaches when the driver has `VK_KHR_present_id` and
+`VK_KHR_present_wait`, as Mesa does). Xwayland does the copy at once but reports it
+complete on its next tick (`xwl_present_execute` queues the completion for
+`crtc_msc + 1`; the tick is a 17 ms timer for windows it does not show itself), so every
+present waited 18 to 23 ms. DXVK presents from its own thread, so Altium's UI thread did
+not block, but the PCB view could not redraw more than about 43 times a second, choppy
+on a 120 or 144 Hz monitor. Measured with `ALTIUM_PRESENT_WAIT_DEBUG=1`, posting wheel
+steps to the view faster than it redraws (see debugging.md):
+
+| | wait for completion | wait for damage |
+|---|---|---|
+| PCB view, 300 steps | 43 redraws/s, 22 ms per wait | 233 to 248 redraws/s, 2.8 ms per wait |
+| Schematic view (346 KB sheet), 120 steps | 24 redraws/s, 18 ms per wait | 24 redraws/s, 0.9 ms per wait |
+
+The schematic is limited by Altium drawing it through Wine's `d2d1` (about 40 ms a frame
+on that sheet), so it redraws no more often, but each frame reaches the screen about 17 ms
+sooner. The down-down-up scroll test above gives the right frame both ways.
+
+Completion still ends a wait when it comes first: it covers a window that gets no damage
+(unmapped, say) and a layer that could not watch the window (no `libxcb-damage`, no X
+connection). The layer polls it every millisecond with a zero timeout. Mesa's X11
+`vkWaitForPresentKHR` then returns `VK_ERROR_DEVICE_LOST`, not `VK_TIMEOUT`, for a present
+that has finished rendering but is not complete yet: `x11_wait_for_present` compares the
+`thrd_timedout` returned by `u_cnd_monotonic_timedwait` with `ETIMEDOUT` (still so in Mesa
+main, October 2026). The layer takes that result as "not complete". Ending the wait on it
+let Wine copy before the X server in about one present in twenty. Presents without an ID,
+and devices without present wait, pass through unchanged. A wait gives up after 100 ms.
+
+`dxvk.conf` stays: in FIFO mode Xwayland would delay the copy itself to its next tick.
 
 `scripts/install.sh` copies the layer and its manifest
 ([`VkLayer_altium_present_wait.json`](../src/presentwait/VkLayer_altium_present_wait.json))
 to `<bottle>/altium-on-linux/vulkan` and sets the bottle variable
 `VK_ADD_IMPLICIT_LAYER_PATH` to that folder, so no other bottle loads it.
-`DISABLE_ALTIUM_PRESENT_WAIT=1` turns it off for a run, and
-`ALTIUM_PRESENT_WAIT_DEBUG=1` logs every wait.
+`DISABLE_ALTIUM_PRESENT_WAIT=1` turns it off for a run,
+`ALTIUM_PRESENT_WAIT_NO_DAMAGE=1` makes it wait for completion only, as the first version
+did, and `ALTIUM_PRESENT_WAIT_DEBUG=1` logs every wait.
 
 ## 12. Schematic text broken and redraws slow (Direct2D text)
 
