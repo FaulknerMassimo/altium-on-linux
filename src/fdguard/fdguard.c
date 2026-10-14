@@ -19,8 +19,9 @@
  * close() returns 0 without closing, dup2() and dup3() fail with EBUSY, close_range()
  * skips them. Each refusal is logged with a backtrace, which names the code that tried.
  * ntdll.so's own closes always go through; one that is not the thread closing its own
- * pipes (they are in its TEB) or a pipe that is only seconds old is logged, so that a
- * close through Wine itself (its handle-to-fd cache) shows up too.
+ * pipes (they are in its TEB, which ntdll's NtCurrentTeb finds) or a pipe that is only
+ * seconds old is logged, so that a close through Wine itself (its handle-to-fd cache)
+ * shows up too.
  *
  * Only closes through the libc functions are seen: glibc's internal ones (fclose and
  * the like) and raw syscalls are not. A forked child is left alone.
@@ -40,7 +41,6 @@
 #include <execinfo.h>
 #include <fcntl.h>
 #include <link.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,20 +56,22 @@
 #define EXPORT __attribute__((visibility("default")))
 
 #define MAX_FDS 65536
-#define ARCH_GET_GS 0x1004
 #define CLOSE_RANGE_CLOEXEC (1U << 2)
-/* x86-64 TEB: ntdll.so keeps its per-thread data (the server fds and the pthread ID among
- * them) in GdiTebBatch. */
+/* x86-64 TEB: ntdll.so keeps its per-thread data (the server fds among them) in
+ * GdiTebBatch. */
+#define TEB_SELF 0x30
 #define TEB_TID 0x48
 #define TEB_BATCH 0x2f0
 #define TEB_BATCH_SIZE 0x4e8
 #define DETAILED_EVENTS 100 /* with a backtrace; after that one line each, up to MAX_EVENTS */
 #define MAX_EVENTS 10000
+#define MAX_NTDLL_EVENTS 200 /* ntdll.so's own odd closes, counted apart so they cannot crowd out refusals */
 
 /* Inode of the pipe ntdll.so created behind each fd (0: none), and when (ns). */
 static uint64_t pipe_ino[MAX_FDS];
 static uint64_t pipe_born[MAX_FDS];
 static uintptr_t ntdll_lo, ntdll_hi; /* ntdll.so's code, once it has created a pipe */
+static void *(*nt_current_teb)(void); /* ntdll.so's: the calling thread's TEB, from a pthread key */
 static pid_t guard_pid;              /* process the marks belong to */
 static int made_pipes;               /* ntdll.so has created a pipe: start-up is over */
 static int mode;                     /* 0 block, 1 log only, 2 off */
@@ -78,7 +80,7 @@ static char log_path[512];
 static int log_fd = -1;
 static uint64_t log_ino; /* the log file's inode: its fd may be closed under us too */
 static volatile int log_lock;
-static unsigned events, blocked;
+static unsigned events, ntdll_events, blocked;
 
 static uint64_t now_ns(void)
 {
@@ -128,36 +130,44 @@ static int in_ntdll(const void *addr)
     if (strcmp(base ? base + 1 : info.dli_fname, "ntdll.so")) return 0;
     uintptr_t fbase = (uintptr_t)info.dli_fbase;
     dl_iterate_phdr(find_code, &fbase);
+    void *lib = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+    if (lib) {
+        nt_current_teb = (void *(*)(void))dlsym(lib, "NtCurrentTeb");
+        dlclose(lib);
+    }
     return 1;
 }
 
-/* Read the current thread's TEB, if it has one (the GS base; 0 outside Wine threads). A
- * thread started by native code shares its creator's, so it may be gone: the read is
- * checked by the kernel. */
-static int read_teb(size_t offset, void *buf, size_t size)
+/* Read the current thread's TEB, if it has one. On the Unix side, ntdll.so finds it in a
+ * pthread key, not in the GS base, which is already 0 while a thread exits; native
+ * threads have none. Before ntdll.so has set the key, it may return another library's
+ * value, so the TEB must point at itself, and the reads are checked by the kernel. */
+/* Copy from our own memory, failing instead of faulting. syscall() takes its arguments
+ * as longs: an int in the stack slot of the last one (flags) leaves garbage above it. */
+static int read_self(void *dst, uintptr_t src, size_t size)
 {
-    uintptr_t gs = 0;
-    if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs) || !gs) return 0;
-    struct iovec local = { buf, size }, remote = { (void *)(gs + offset), size };
-    return syscall(SYS_process_vm_readv, getpid(), &local, 1, &remote, 1, 0) == (long)size;
+    struct iovec local = { dst, size }, remote = { (void *)src, size };
+    return syscall(SYS_process_vm_readv, (long)getpid(), &local, 1ul, &remote, 1ul, 0ul) == (long)size;
 }
 
-/* Is fd one of the current thread's own server fds? Its TEB holds them next to its
- * pthread ID; the ID also tells a native thread using its creator's TEB apart. */
+static int read_teb(size_t offset, void *buf, size_t size)
+{
+    uintptr_t teb = nt_current_teb ? (uintptr_t)nt_current_teb() : 0, self = 0;
+    return teb && read_self(&self, teb + TEB_SELF, sizeof(self)) && self == teb && read_self(buf, teb + offset, size);
+}
+
+/* Is fd one of the current thread's own server fds? Returns 1 if so, 0 if its TEB does
+ * not hold it, -1 if the thread has no TEB. */
 static int own_server_fd(int fd)
 {
     unsigned char batch[TEB_BATCH_SIZE];
-    if (!read_teb(TEB_BATCH, batch, sizeof(batch))) return 0;
-    pthread_t self = pthread_self();
-    int has_fd = 0, has_self = 0;
+    if (!read_teb(TEB_BATCH, batch, sizeof(batch))) return -1;
     for (size_t i = 0; i + sizeof(int) <= sizeof(batch); i += sizeof(int)) {
         int v;
         memcpy(&v, batch + i, sizeof(v));
-        if (v == fd) has_fd = 1;
-        if (i % sizeof(self) == 0 && i + sizeof(self) <= sizeof(batch) && !memcmp(batch + i, &self, sizeof(self)))
-            has_self = 1;
+        if (v == fd) return 1;
     }
-    return has_fd && has_self;
+    return 0;
 }
 
 /* ---- Log ------------------------------------------------------------------- */
@@ -182,11 +192,13 @@ static void out(const char *s, size_t n)
     syscall(SYS_write, 2, s, n);
 }
 
-static void report(const char *what, const char *op, int fd, const void *caller)
+/* own: for ntdll.so's own closes, what own_server_fd() said; 2 for the other reports. */
+static void report(const char *what, const char *op, int fd, const void *caller, int own)
 {
     int saved = errno;
-    unsigned seq = __atomic_fetch_add(&events, 1, __ATOMIC_RELAXED);
-    if (seq >= MAX_EVENTS) { errno = saved; return; }
+    unsigned seq = own == 2 ? __atomic_fetch_add(&events, 1, __ATOMIC_RELAXED)
+                            : __atomic_fetch_add(&ntdll_events, 1, __ATOMIC_RELAXED);
+    if (seq >= (own == 2 ? MAX_EVENTS : MAX_NTDLL_EVENTS)) { errno = saved; return; }
     while (__sync_lock_test_and_set(&log_lock, 1)) ;
     open_log();
 
@@ -213,15 +225,16 @@ static void report(const char *what, const char *op, int fd, const void *caller)
     struct tm tm;
     localtime_r(&rt.tv_sec, &tm);
     int n = snprintf(line, sizeof(line),
-                     "fd-guard %02d:%02d:%02d %.3f: %s %s fd %d (%s, %llu ms old) in %s pid %d, thread %ld \"%s\" (Wine %04llx), "
+                     "fd-guard %02d:%02d:%02d %.3f: %s %s fd %d (%s, %llu ms old) in %s pid %d, thread %ld \"%s\" (Wine %04llx%s), "
                      "called from %s+%#lx\n",
                      tm.tm_hour, tm.tm_min, tm.tm_sec, now_ns() / 1e9, what, op, fd, target, (unsigned long long)age, proc,
                      getpid(), (long)syscall(SYS_gettid), thread, (unsigned long long)wine_tid,
+                     own == 2 ? "" : own < 0 ? ", no TEB" : ", fd not in its TEB",
                      mod ? mod + 1 : info.dli_fname ? info.dli_fname : "?",
                      (unsigned long)((uintptr_t)caller - (uintptr_t)info.dli_fbase));
     out(line, n < (int)sizeof(line) ? (size_t)n : sizeof(line) - 1);
 
-    if (seq < DETAILED_EVENTS) {
+    if (seq < (own == 2 ? DETAILED_EVENTS : DETAILED_EVENTS / 10)) {
         void *frames[32];
         int count = backtrace(frames, 32);
         for (int i = 1; i < count; i++) { /* frame 0 is report() */
@@ -285,17 +298,19 @@ static int refuse(int fd, const void *caller, const char *op)
 {
     if (mode == 2 || !marked(fd)) return 0;
     if (in_ntdll(caller)) {
-        if (now_ns() - pipe_born[fd] >= fresh_ns && !own_server_fd(fd)) report("ntdll.so, not its own thread's pipe:", op, fd, caller);
+        int own;
+        if (now_ns() - pipe_born[fd] >= fresh_ns && (own = own_server_fd(fd)) != 1)
+            report("ntdll.so, not its own thread's pipe:", op, fd, caller, own);
         unmark(fd);
         return 0;
     }
     if (mode == 1) {
-        report("let through stray", op, fd, caller);
+        report("let through stray", op, fd, caller, 2);
         unmark(fd);
         return 0;
     }
     __atomic_fetch_add(&blocked, 1, __ATOMIC_RELAXED);
-    report("refused stray", op, fd, caller);
+    report("refused stray", op, fd, caller, 2);
     return 1;
 }
 

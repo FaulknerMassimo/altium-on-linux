@@ -6,6 +6,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+/* Like Wine's: the TEB comes from per-thread storage (a pthread key), not the GS base. */
+static __thread void *teb;
+void *NtCurrentTeb(void) { return teb; }
+void fake_set_teb(void *t) { teb = t; }
+
 int fake_server_pipe(int fds[2]) { return pipe2(fds, O_CLOEXEC); }
 int fake_close(int fd) { return close(fd); }
 

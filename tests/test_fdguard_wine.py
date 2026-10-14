@@ -4,9 +4,12 @@
 Builds the guard, tests/fdguard_poke.c (a native library that closes every pipe in the
 process when told to) and tests/fdguard_wine.c (a Windows program), and runs the program
 in the bottle's running Wine session with both libraries preloaded. The program starts
-and ends 320 threads, then the poke closes every pipe while a worker thread keeps talking
-to wineserver; the worker, the main thread and new threads must still get through, and
-the guard's log must show no complaint about Wine's own closes (thread exits).
+and ends 320 threads, and four that live past the guard's 5 s grace for new pipes (their
+exits are checked against their TEB). Then the poke closes every pipe while a worker
+thread keeps talking to wineserver; the worker, the main thread and new threads must
+still get through, and the guard's log must show no complaint about Wine's own closes.
+FRESH_MS=0 in the environment checks every close of Wine's, even those right after a
+pipe is made, which the guard normally lets through.
 
 With --control, runs it once more without the guard, which must break (the program fails
 or hangs and is killed after 60 s): shows that the poke does what a stray close does.
@@ -61,7 +64,7 @@ def run(bottle, runner, work, guard, timeout):
         if os.path.exists(f"{work}/{name}"):
             os.remove(f"{work}/{name}")
     preload = (f"{work}/altium_fd_guard.so:" if guard else "") + f"{work}/fdguard_poke.so"
-    env = [f"LD_PRELOAD={preload}", f"ALTIUM_FD_GUARD_LOG={work}/guard.log",
+    env = [f"LD_PRELOAD={preload}", f"ALTIUM_FD_GUARD_LOG={work}/guard.log", "ALTIUM_FD_GUARD_FRESH_MS=" + os.environ.get("FRESH_MS", "5000"),
            f"FDPOKE_TRIGGER={work}/trigger", f"FDPOKE_DONE={work}/done",
            f"FDPOKE_TRIGGER_WIN={winpath(work + '/trigger')}", f"FDPOKE_DONE_WIN={winpath(work + '/done')}",
            f"FDPOKE_RESULT_WIN={winpath(work + '/result')}",
@@ -124,7 +127,8 @@ def main():
         print("all passed" if not failures else f"{failures} failed")
         return 1 if failures else 0
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        if not os.environ.get("KEEP"):
+            shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":

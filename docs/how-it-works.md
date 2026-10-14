@@ -795,7 +795,9 @@ from a short-lived one in `NtCreateUserProcess`), and closed by the thread itsel
 ends. The first thread's request pipe comes from wineserver over its socket instead. The
 thread writes requests to one pipe, reads replies from another and waits on the third.
 The thread keeps the fd numbers in its TEB (`GdiTebBatch`; in soda-11.0-7 the request,
-reply and two wait fds are four `int`s at TEB+0x384).
+reply and two wait fds are four `int`s at TEB+0x384). On the Unix side, ntdll.so finds the
+TEB through a pthread key (its exported `NtCurrentTeb` is `pthread_getspecific`), not the
+GS base: the GS base is already 0 while a thread exits, and native threads have no TEB.
 
 Something in the process closes some of those fds, most likely a double close: code
 closes its own fd, the number goes to a new thread's pipe, and the code closes it again.
@@ -845,10 +847,11 @@ apart by its return address, so ntdll's own closes always go through.
 Each refusal goes to `<bottle>/altium-on-linux/logs/fd-guard.log` and to stderr (so into
 `debug-launch.sh`'s log), with a backtrace that names the code that tried. ntdll.so
 closing a pipe is also logged if the pipe is not the calling thread's own and is more
-than five seconds old. The thread's own pipes are found in its TEB, next to its
-`pthread_self()`, and a native thread shares its creator's TEB, so its ID tells the two
-apart. That catches a close through Wine itself, for example its fd cache holding a stale
-number. `ALTIUM_FD_GUARD=log` only logs, `=off` turns the guard off.
+than five seconds old. The thread's own pipes are found in its TEB, which the guard gets
+from ntdll's `NtCurrentTeb` and checks (a TEB points at itself at +0x30). That catches a
+close through Wine itself, for example its fd cache holding a stale number. Those reports
+are counted apart from refusals, so a flood of them cannot use up the log's limit.
+`ALTIUM_FD_GUARD=log` only logs, `=off` turns the guard off.
 
 What the guard cannot see:
 
@@ -861,16 +864,24 @@ What the guard cannot see:
 
 Tests:
 
-- [`tests/test_fdguard.py`](../tests/test_fdguard.py) checks twelve cases on the host,
-  with a stand-in `ntdll.so` and fake TEBs: stray closes, Wine's own closes (new pipes,
-  thread exits, another thread's pipe, a borrowed TEB), stale numbers, `dup2`/`dup3`,
-  `close_range`/`closefrom`, the received pipe, forks, and the log and off modes.
+- [`tests/test_fdguard.py`](../tests/test_fdguard.py) checks 14 cases on the host, with
+  a stand-in `ntdll.so` whose `NtCurrentTeb` returns fake TEBs: stray closes, Wine's own
+  closes (new pipes, thread exits, another thread's pipe, no TEB, a value that is not a
+  TEB), stale numbers, `dup2`/`dup3`, `close_range`/`closefrom`, the received pipe,
+  forks, and the log and off modes.
 - [`tests/test_fdguard_wine.py`](../tests/test_fdguard_wine.py) runs a Windows program in
-  the bottle's running session. The program starts and ends 320 threads; the log shows no
-  complaint about Wine's own closes. Then a native library closes every pipe in the
-  process while a worker thread talks to wineserver. With the guard, the 8 server-pipe
-  closes are refused, the worker makes 243 more calls, and the main thread and 64 new
-  threads work. Without it (`--control`), the program dies.
+  the bottle's running session. The program starts and ends 320 threads, and four that
+  live 6 s, so that their exits are checked against their TEB; the log shows no complaint
+  about Wine's own closes. Then a native library closes every pipe in the process while a
+  worker thread talks to wineserver. With the guard, the 24 server-pipe closes are
+  refused, the worker makes 241 more calls, and the main thread and 64 new threads work.
+  Without it (`--control`), the program dies.
+
+The first version found the TEB through the GS base and called `process_vm_readv` with
+an `int` for its last argument, which `syscall()` reads as a `long`, so the kernel saw
+garbage flags. Every long-lived thread that exited in Altium was then logged as closing
+another thread's pipe. These closes were only logged, never refused. The test above did
+not catch it: all its threads lived under the 5 s grace.
 
 Not done yet: confirming over long Altium sessions that the freezes are gone, and fixing
 whatever the guard's log names as the culprit at its source.

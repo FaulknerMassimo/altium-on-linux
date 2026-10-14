@@ -2,7 +2,9 @@
  * Windows side of tests/test_fdguard_wine.py: run in the bottle with the fd guard and
  * tests/fdguard_poke.c preloaded.
  *
- * Starts and ends 320 threads that each talk to wineserver, then keeps a worker thread
+ * Starts and ends 320 threads that each talk to wineserver, and four that live for 6 s
+ * (past the guard's 5 s grace for new pipes, so their exits are checked against their
+ * TEB), then keeps a worker thread
  * doing wineserver calls (CreateEventW/CloseHandle) while the poke library closes every
  * pipe in the process, as a native double close would. Then checks that the worker, the
  * main thread and new threads can still talk to wineserver. Without the guard, the
@@ -78,6 +80,14 @@ static DWORD WINAPI short_thread(void *arg)
     return 0;
 }
 
+static DWORD WINAPI long_thread(void *arg)
+{
+    (void)arg;
+    if (!server_call()) return 1;
+    Sleep(6000);
+    return server_call() ? 0 : 1;
+}
+
 static volatile int stop_worker;
 static volatile long worker_calls, worker_failures;
 
@@ -117,6 +127,8 @@ void start_entry(void)
         ExitProcess(2);
     }
     result = CreateFileW(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0);
+    HANDLE long_threads[4];
+    for (int i = 0; i < 4; i++) long_threads[i] = CreateThread(0, 0, long_thread, 0, 0, 0);
     print_num("churn: ", churn(320, 32), " of 320 threads ok\n");
 
     HANDLE thread = CreateThread(0, 0, worker, 0, 0, 0);
@@ -135,6 +147,9 @@ void start_entry(void)
     int after = churn(64, 16);
     stop_worker = 1;
     int worker_ended = WaitForSingleObject(thread, 5000) == WAIT_OBJECT_0;
+    int long_ok = 0;
+    for (int i = 0; i < 4; i++) long_ok += long_threads[i] && WaitForSingleObject(long_threads[i], 20000) == WAIT_OBJECT_0;
+    print_num("long threads: ", long_ok, " of 4 ended\n");
     print_num("worker: ", before > 0, " before the poke, ");
     print_num("", worker_calls - at_poke, " calls after it, ");
     print_num("", worker_failures, " failed, ");
@@ -142,7 +157,7 @@ void start_entry(void)
     print_num("main: ", main_ok, " of 20 calls ok after the poke\n");
     print_num("new threads: ", after, " of 64 ok after the poke\n");
     int pass = waited < 30000 && before > 0 && worker_calls - at_poke > 50 && !worker_failures && worker_ended &&
-               main_ok == 20 && after == 64;
+               main_ok == 20 && after == 64 && long_ok == 4;
     print(pass ? "result: PASS\n" : "result: FAIL\n");
     ExitProcess(pass ? 0 : 1);
 }

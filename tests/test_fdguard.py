@@ -7,7 +7,8 @@ close (by code outside ntdll.so) of a pipe ntdll.so made must be refused and log
 backtrace; dup2/dup3 onto one must fail with EBUSY; close_range and closefrom must skip
 them, and so must the first pipe ntdll.so receives over a socket (the first thread's
 request pipe, sent by wineserver) but no later one. ntdll.so's own closes must go through: silently when the pipe is new or the thread's
-own (its TEB holds it), logged when it is another thread's or the TEB is borrowed. A fd
+own (its TEB, from NtCurrentTeb, holds it), logged when it is another thread's or the
+thread has no TEB (or NtCurrentTeb returns something that is not one). A fd
 whose pipe went away unseen, a forked child, and ALTIUM_FD_GUARD=log/off are left alone.
 
     tests/test_fdguard.py
@@ -30,9 +31,11 @@ CASES = {
     "fresh": ({}, "fresh: close 0, open 0\n", []),
     "own-exit": ({"ALTIUM_FD_GUARD_FRESH_MS": "0"}, "own-exit: close 0 0, open 0 0\n", []),
     "other-thread": ({"ALTIUM_FD_GUARD_FRESH_MS": "0"}, "other-thread: close 0, open 0\n",
-                     [("ntdll.so, not its own thread's pipe: close of", 1), (r"\(Wine 0333\)", 1)]),
-    "borrowed-teb": ({"ALTIUM_FD_GUARD_FRESH_MS": "0"}, "borrowed-teb: close 0, open 0\n",
-                     [("ntdll.so, not its own thread's pipe: close of", 1), (r"\(Wine 0222\)", 1)]),
+                     [("ntdll.so, not its own thread's pipe: close of", 1), (r"\(Wine 0333, fd not in its TEB\)", 1)]),
+    "no-teb": ({"ALTIUM_FD_GUARD_FRESH_MS": "0"}, "no-teb: close 0, open 0\n",
+               [("ntdll.so, not its own thread's pipe: close of", 1), (r"\(Wine 0000, no TEB\)", 1)]),
+    "bad-teb": ({"ALTIUM_FD_GUARD_FRESH_MS": "0"}, "bad-teb: close 0, open 0\n",
+                [("ntdll.so, not its own thread's pipe: close of", 1), (r"\(Wine 0000, no TEB\)", 1)]),
     "stale": ({}, "stale: same number 1, close 0, open 0\n", []),
     "dup": ({}, "dup: dup2 -1 EBUSY, dup3 -1 EBUSY, pipes 1 1\ndup: dup2 onto a plain fd 1\n",
             [("refused stray dup2 onto", 1), ("refused stray dup3 onto", 1)]),

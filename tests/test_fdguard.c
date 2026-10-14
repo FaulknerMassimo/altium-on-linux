@@ -1,7 +1,8 @@
 /* Host test driver for src/fdguard/fdguard.c (run by tests/test_fdguard.py with the guard
  * preloaded): runs the scenario named on the command line and prints what happened to the
  * file descriptors. "Wine" pipes come from fake_server_pipe() in a library named
- * ntdll.so; threads get a fake TEB (GS base) holding their pipes, as Wine's do. */
+ * ntdll.so; threads get a fake TEB holding their pipes, which that library's NtCurrentTeb
+ * returns, as Wine's do. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -19,8 +20,9 @@
 int fake_server_pipe(int fds[2]);
 int fake_close(int fd);
 int fake_receive_fd(int sock);
+void fake_set_teb(void *teb);
 
-#define ARCH_SET_GS 0x1001
+#define TEB_SELF 0x30
 #define TEB_TID 0x48
 #define TEB_BATCH 0x2f0
 
@@ -39,13 +41,13 @@ static int is_pipe(int fd)
     return !fstat(fd, &st) && S_ISFIFO(st.st_mode);
 }
 
-/* A TEB as Wine's ntdll.so lays out its thread data: the server fds and the pthread ID
- * somewhere in GdiTebBatch. */
-static unsigned char *make_teb(unsigned tid, pthread_t owner, const int *fds, int count)
+/* A TEB as Wine's ntdll.so lays out its thread data: the server fds somewhere in
+ * GdiTebBatch. */
+static unsigned char *make_teb(unsigned tid, const int *fds, int count)
 {
     unsigned char *teb = calloc(1, 0x1000);
+    memcpy(teb + TEB_SELF, &teb, sizeof(teb));
     memcpy(teb + TEB_TID, &(uint64_t){ tid }, 8);
-    memcpy(teb + TEB_BATCH + 0x88, &owner, sizeof(owner));
     memcpy(teb + TEB_BATCH + 0x94, fds, count * sizeof(int));
     return teb;
 }
@@ -64,7 +66,7 @@ static void send_fd(int sock, int fd)
     sendmsg(sock, &msg, 0);
 }
 
-static void set_teb(unsigned char *teb) { syscall(SYS_arch_prctl, ARCH_SET_GS, teb); }
+static void set_teb(unsigned char *teb) { fake_set_teb(teb); }
 
 /* own-exit: a thread closes its own pipes, as Wine's exit_thread does. */
 static void *own_exit(void *arg)
@@ -72,7 +74,7 @@ static void *own_exit(void *arg)
     (void)arg;
     int p[2];
     fake_server_pipe(p);
-    set_teb(make_teb(0x111, pthread_self(), p, 2));
+    set_teb(make_teb(0x111, p, 2));
     int r0 = fake_close(p[0]), r1 = fake_close(p[1]);
     printf("own-exit: close %d %d, open %d %d\n", r0, r1, is_open(p[0]), is_open(p[1]));
     return NULL;
@@ -89,7 +91,7 @@ static void *other(void *arg)
 {
     (void)arg;
     fake_server_pipe(other_pipe);
-    set_teb(make_teb(0x222, pthread_self(), other_pipe, 2));
+    set_teb(make_teb(0x222, other_pipe, 2));
     pthread_mutex_lock(&lock);
     stage = 1;
     pthread_cond_broadcast(&cond);
@@ -137,16 +139,24 @@ int main(int argc, char **argv)
         start_other();
         int mine[2];
         fake_server_pipe(mine);
-        set_teb(make_teb(0x333, pthread_self(), mine, 2));
+        set_teb(make_teb(0x333, mine, 2));
         int r = fake_close(other_pipe[1]);
         printf("other-thread: close %d, open %d\n", r, is_open(other_pipe[1]));
         stop_other();
-    } else if (!strcmp(s, "borrowed-teb")) {
-        /* A native thread started by a Wine thread has its creator's TEB. */
+    } else if (!strcmp(s, "no-teb")) {
+        /* ntdll.so code on a thread without a TEB (a native one) closes a Wine thread's pipe. */
         start_other();
-        set_teb(make_teb(0x222, other_thread, other_pipe, 2));
         int r = fake_close(other_pipe[0]);
-        printf("borrowed-teb: close %d, open %d\n", r, is_open(other_pipe[0]));
+        printf("no-teb: close %d, open %d\n", r, is_open(other_pipe[0]));
+        stop_other();
+    } else if (!strcmp(s, "bad-teb")) {
+        /* Before ntdll.so sets its key, NtCurrentTeb can return some other library's value. */
+        start_other();
+        unsigned char *junk = make_teb(0x444, other_pipe, 2);
+        memset(junk + TEB_SELF, 0, 8);
+        set_teb(junk);
+        int r = fake_close(other_pipe[0]);
+        printf("bad-teb: close %d, open %d\n", r, is_open(other_pipe[0]));
         stop_other();
     } else if (!strcmp(s, "stale")) {
         /* The pipe went away unseen; its number now holds another file. */
