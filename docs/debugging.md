@@ -82,6 +82,35 @@ writes a full dump and prints `clrthreads` and `clrstack -all`. Quirks under Win
 - `dotnet-stack report` collects fine but its parser calls
   `tdh.dll!TdhGetEventInformation`, which Wine lacks, and crashes.
 
+### A thread waiting for wineserver forever
+
+When an idle UI thread waits on a lock (`/proc/<pid>/task/*/syscall`: `202 <address>
+0x80`), find the lock's owner (the `int` at address + 8, as seen inside the Flatpak,
+matches the last field of `NSpid` in `/proc/<pid>/task/*/status`) and see what it is doing.
+If the owner is in `read()` (`0 <fd>`) on a pipe that wineserver also holds
+(`/proc/<wineserver pid>/fd`) while wineserver sits in `epoll_wait`, the owner has
+probably lost its pipes ([how-it-works §20](how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver)).
+`winedbg` cannot help here: attaching starts a thread, which needs the loader lock.
+
+- **Stack without a debugger:** the last two fields of `/proc/<pid>/task/<tid>/syscall`
+  are the stack pointer and the program counter. Read the stack from `/proc/<pid>/mem`,
+  keep the values that point into executable mappings (`/proc/<pid>/maps`), and turn each
+  into `module+offset`. Wine's unix libraries are stripped, but `readelf
+  --debug-dump=frames` gives every function's range, and Wine's TRACE format strings in a
+  function name it (`client_surface_present` and `client_surface_update` are even
+  exported). gdb attaches (with `-iex 'set architecture i386:x86-64' -ex 'handle all
+  nostop noprint pass'`; without the first it falls back to 32-bit) but cannot unwind
+  these frames.
+- **Each thread's server fds:** `gdb -p <pid>` with `$gs_base` per thread gives its TEB.
+  The Wine thread ID is at TEB+0x48, and the request, reply and two wait fds are four
+  `int`s at TEB+0x384 (soda-11.0-7). A thread is broken if its pipes' inodes are not from
+  the same time (the request and wait pipes are created together), if two threads have the
+  same fd number, or if wineserver no longer holds the pipe.
+- **The fd guard's log**, `<bottle>/altium-on-linux/logs/fd-guard.log` (also in the
+  `debug-launch.sh` log): `refused stray close of fd N ... called from <module>+<offset>`
+  and a backtrace, for each close it refused. `ALTIUM_FD_GUARD=log` (with `--env`) lets
+  them through and only logs them.
+
 ## Slow redraws: `scripts/redraw-bench.sh` and `scripts/profile.py`
 
 `redraw-bench.sh` measures how expensive a view's redraws are. With a document open, it

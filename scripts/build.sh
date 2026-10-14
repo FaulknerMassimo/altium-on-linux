@@ -2,12 +2,12 @@
 # Build the Windows binaries (64-bit PE) with clang + lld-link. No Windows SDK,
 # MinGW or C runtime is needed: each source declares the few APIs it uses and
 # links against import libraries generated from the .def files next to it.
-# Also builds the Linux Vulkan layer (no Vulkan headers needed either).
+# Also builds the Linux Vulkan layer (no Vulkan headers needed either) and the fd guard.
 #
 #   scripts/build.sh            -> build/cmd.exe, build/SHFolder.dll,
 #                                  build/wininfo.exe, build/clearex.exe, build/postmsg.exe,
 #                                  build/displayfix.exe,
-#                                  build/VkLayer_altium_present_wait.so
+#                                  build/VkLayer_altium_present_wait.so, build/altium_fd_guard.so
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -64,5 +64,8 @@ link_exe displayfix start_entry "$SRC/tools/displayfix.c" "$SRC/tools/advapi32.d
 # (the newest is dlopen, glibc 2.34; Bottles' GNOME 49 runtime has 2.42).
 clang -shared -fPIC -O2 -fvisibility=hidden -fno-stack-protector -U_FORTIFY_SOURCE -Wall -Wextra -Werror \
     -o "$OUT/VkLayer_altium_present_wait.so" "$SRC/presentwait/presentwait.c"
+# Preloaded into every Wine process of the bottle, inside the same Flatpak: same rules.
+clang -shared -fPIC -O2 -fvisibility=hidden -fno-stack-protector -U_FORTIFY_SOURCE -Wall -Wextra -Werror \
+    -o "$OUT/altium_fd_guard.so" "$SRC/fdguard/fdguard.c"
 
 ls -l "$OUT"/*.exe "$OUT"/*.dll "$OUT"/*.so

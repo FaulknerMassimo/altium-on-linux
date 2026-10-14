@@ -25,7 +25,7 @@ redistributed here.
 | Heads-up display in the PCB view | fixed ([§14](docs/how-it-works.md#14-heads-up-display-frozen-in-the-pcb-view-layered-child-windows)); drawn over black rather than blended with the board |
 | Two monitors with different scaling | Altium's windows open on the external monitor ([§17](docs/how-it-works.md#17-windows-split-across-monitors-hyprland-mixed-scaling)); moving them to the laptop screen, or starting Altium from it, still misplaces them ([known issues](docs/known-issues.md#windows-misplaced-on-the-other-monitor-mixed-scaling)) |
 | Closing the lid, switching a monitor off and on | Altium follows the new layout ([§19](docs/how-it-works.md#19-altium-drawn-offset-after-a-monitor-goes-away-and-comes-back)); needs the Hyprland hook |
-| Loading a project | occasionally freezes (seen three times); can be unfrozen without a restart ([known issues](docs/known-issues.md#intermittent-freeze-while-a-project-loads)) |
+| Freezes now and then (a Wine thread loses its pipes to wineserver) | stray closes of those pipes refused and logged since 2026-10-14 ([§20](docs/how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver)); not yet confirmed over long sessions, and the code that closes them is not found yet |
 
 The full list, with what is known about each, is in [docs/known-issues.md](docs/known-issues.md).
 
@@ -66,6 +66,7 @@ Hyprland rules only matter on Hyprland.
 | 17 | Two monitors at different scales (Hyprland): splash split across them, Messages panel on the other screen | external monitor made X11's primary, so Wine and Altium put their windows there |
 | 18 | Schematic redraws slow (24 a second on a large sheet) | `SHFolder.dll` proxy skips Wine's Direct3D state swaps around every Direct2D shape |
 | 19 | After a monitor goes away and comes back (closed lid, monitor off): Altium drawn offset, dialogs off-screen, a monitor lost | registry: `EmulateModeset=N`; Hyprland hook resyncs Wine's monitor list (`scripts/refresh-displays.sh`) |
+| 20 | Altium freezes now and then: no redraws, no input (`wine client error … Bad file descriptor` earlier in the log) | fd guard (`LD_PRELOAD`) keeps native code from closing the pipes Wine's threads use to talk to wineserver, and logs who tried |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.
@@ -171,16 +172,17 @@ and you can use your license.
 | `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text, layered windows, Direct2D arcs, stale panel focus | 9, 10, 12, 13, 14, 15, 16 |
 | `Program Files\Altium\AD26\dxvk.conf` | `dxgi.syncInterval = 0` | 11 |
 | `<bottle>/altium-on-linux/vulkan/` | Vulkan layer (Linux library and manifest) that waits for each present | 11 |
+| `<bottle>/altium-on-linux/fdguard/` | fd guard (Linux library, preloaded into the bottle's Wine processes); logs to `<bottle>/altium-on-linux/logs/fd-guard.log` | 20 |
 | `windows\Fonts\segoeui-selawik*.ttf` | Selawik renamed to "Segoe UI", built locally from Microsoft's release | 8 |
 | `HKCU\Software\Wine\DllOverrides` | `tabtip.exe` disabled | 4 |
 | `HKCU\Software\Wine\AppDefaults\X2.EXE\DllOverrides` | `shfolder` = `native,builtin` | 9, 10, 12, 13, 14, 15 |
 | `HKCU\Software\Microsoft\Avalon.Graphics` | WPF software rendering | 4 |
 | `HKCU\Software\Altium\Altium Designer {…}\…\AltiumPortal\Account` | `UnifiedLogin` = `1` | 5 |
 | `HKLM\…\Fonts`, `HKCU\Control Panel\Desktop` | register the fonts, RGB font smoothing | 8 |
-| `bottle.yml` | `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1`, `SteamAppId=altium`, `VK_ADD_IMPLICIT_LAYER_PATH=<bottle>/altium-on-linux/vulkan` | 1, 2, 11 |
+| `bottle.yml` | `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1`, `SteamAppId=altium`, `VK_ADD_IMPLICIT_LAYER_PATH=<bottle>/altium-on-linux/vulkan`, `LD_PRELOAD=<bottle>/altium-on-linux/fdguard/altium_fd_guard.so` | 1, 2, 11, 20 |
 
-The shims are freestanding C (no C runtime, no Windows headers) and the Vulkan layer is
-plain C without Vulkan headers, all built with `scripts/build.sh`; each source file
+The shims are freestanding C (no C runtime, no Windows headers), the Vulkan layer is
+plain C without Vulkan headers and the fd guard plain C, all built with `scripts/build.sh`; each source file
 explains what it does and why.
 
 **After updating Altium** to a new major version (a new `AD27` folder), run
@@ -188,7 +190,8 @@ explains what it does and why.
 
 **To undo:** delete `cmd.exe`, `SHFolder.dll` and `dxvk.conf` from Altium's folder (or
 restore the `.bak` copies), the `shfolder` value under `AppDefaults\X2.EXE` and the
-bottle variable `VK_ADD_IMPLICIT_LAYER_PATH`; the other changes are harmless to keep.
+bottle variables `VK_ADD_IMPLICIT_LAYER_PATH` and `LD_PRELOAD`; the other changes are
+harmless to keep.
 
 ## Debugging
 
@@ -207,6 +210,8 @@ bottle variable `VK_ADD_IMPLICIT_LAYER_PATH`; the other changes are harmless to 
 | `scripts/profile.py` | sampling profiler for Altium's UI thread (modules, functions, system calls) |
 | `tests/test_rsa.py` | checks the raw RSA code against Python on random keys |
 | `tests/test_arc.py` | checks the Direct2D arc code on random arcs |
+| `tests/test_fdguard.py` | checks the fd guard on the host, with a stand-in `ntdll.so` |
+| `tests/test_fdguard_wine.py` | checks the fd guard in a Wine process of the running bottle |
 
 ## Repository layout
 
@@ -219,8 +224,9 @@ scripts/         build, install, debugging tools (lib.sh is shared)
 src/cmdshim/     cmd.exe shim
 src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA, Direct2D text, layered windows, Direct2D arcs, VCL focus)
 src/presentwait/ Vulkan layer that waits for each present (Linux)
+src/fdguard/     LD_PRELOAD library that protects Wine's server pipes (Linux)
 src/tools/       wininfo.exe, clearex.exe, postmsg.exe (diagnostics), displayfix.exe (monitor list)
-tests/           raw RSA and Direct2D arc tests
+tests/           raw RSA, Direct2D arc and fd guard tests
 ```
 
 ## License

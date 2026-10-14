@@ -29,6 +29,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 17 | With two monitors: splash split across them, Messages panel on the other screen, too big | Hyprland misplaces X11 windows that open or move on a monitor other than the focused one when the monitors' scales differ; Wine's primary monitor is the laptop | external monitor made X11's primary (Hyprland hook) |
 | 18 | Schematic redraws slow (24 a second on a 346 KB sheet) | Wine's d2d1 swaps the whole Direct3D context state twice per shape, and DXVK copies and rebinds it every time | `SHFolder.dll` proxy skips the swaps while nothing else uses the context |
 | 19 | After a monitor goes away and comes back: Altium drawn offset and cropped, dialogs off-screen | Proton keeps each output's first recorded mode (emulated mode changes) and cannot repoint its per-slot registry links, so a reconnected monitor gets a stale size, a lost slot or a second primary | `EmulateModeset=N`; Hyprland hook runs `refresh-displays.sh`, which deletes the slot links so Wine rebuilds them |
+| 20 | Altium freezes now and then: no redraws, no input, the UI thread idle | native code in Altium's process closes file descriptors it does not own, among them the pipes Wine's threads use to talk to wineserver; a thread then waits forever, often holding a lock | fd guard (`LD_PRELOAD`) refuses closes of Wine's server pipes from other code and logs who tried |
 
 ## 1. ICU error in the installer
 
@@ -779,3 +780,97 @@ make explorer rebuild the list.
 
 Not fixed: a Wine process can exit while monitors change (see
 [known-issues.md](known-issues.md#a-wine-process-can-exit-when-a-monitor-goes-away)).
+
+## 20. Freezes: Wine threads lose their pipes to wineserver
+
+Now and then Altium stopped responding: no redraws, no input, the UI thread at no CPU.
+It happened three times in one session on 2026-10-10 and after 68 minutes on 2026-10-14.
+Earlier in each such session the log has `wine client error:<thread>: read: Bad file
+descriptor` (or `write:`), four times on 2026-10-14. Later, dozens of threads report
+`RtlpWaitForCriticalSection ... loader_section wait timed out`.
+
+Every Wine thread talks to wineserver over three pipes. They are created by `server_pipe()`
+in ntdll.so when the thread starts (`pipe2()`; ntdll creates pipes nowhere else, apart
+from a short-lived one in `NtCreateUserProcess`), and closed by the thread itself when it
+ends. The first thread's request pipe comes from wineserver over its socket instead. The
+thread writes requests to one pipe, reads replies from another and waits on the third.
+The thread keeps the fd numbers in its TEB (`GdiTebBatch`; in soda-11.0-7 the request,
+reply and two wait fds are four `int`s at TEB+0x384).
+
+Something in the process closes some of those fds, most likely a double close: code
+closes its own fd, the number goes to a new thread's pipe, and the code closes it again.
+The owner then fails on its next request: `abort_thread` ends it, whatever locks it
+holds. Or the number is given out again, to another thread's pipe, before the owner
+notices. The owner then reads that thread's pipe and waits for a reply that never comes,
+because wineserver writes it to the pipe the owner had. Going by Wine's source, that write
+fails with `EPIPE` and wineserver drops the thread. The thread itself is still alive, and
+so are the locks it holds.
+
+The 2026-10-14 freeze, read from the live process (stacks from the kernel's saved stack
+pointer and `.eh_frame`, function names from Wine's TRACE strings; see debugging.md):
+
+- `dxvk-submit` (Wine thread `0c00`) was presenting a child window's swapchain. In
+  `win32u_vkQueuePresentKHR`, `client_surface_present` took win32u's `surfaces_lock`
+  (win32u.so+0x223820) and called `NtUserGetDCEx`, which sent `get_visible_region` and
+  blocked in `read()` on its reply fd, 1882.
+- fd 1882 was a pipe much newer than the thread's request and wait pipes (inodes 186329
+  against 62687 and 64629). It was also the reply fd of thread `01f8`, a `dxvk-shader`
+  thread started minutes before. wineserver held neither `0c00`'s request pipe nor its
+  wait pipe any more: it had given the thread up.
+- Waiting for `surfaces_lock`: the UI thread (DXVK creating a surface,
+  `win32u_vkCreateWin32SurfaceKHR`), a second `dxvk-submit`, and a `.NET TP Worker` that
+  held the loader lock. The ~25 threads logging `loader_section` waited for that one.
+- Other threads of the same DXVK device had crossed fds too: `dxvk-queue` shared its
+  request and wait fd numbers with a newer thread.
+
+The 2026-10-10 freezes fit: a thread had vanished holding ntdll's `fd_cache_mutex`
+([known issues](known-issues.md#intermittent-freeze-while-a-project-loads)), another
+`dxvk-submit` had died holding the same `surfaces_lock`, and closing its view then hung.
+
+Who closes them is not known yet. Wine's own code does not, apart from the cases above.
+Two of the `wine client error`s and the 2026-10-14 freeze came right after DXVK had
+created a swapchain or a device (`DXGI: MakeWindowAssociation`, `Loaded igd10iumd64.dll`).
+That points at native code that runs then: Mesa's Vulkan driver and X11 WSI, libxcb.
+The present-wait layer (§11) also opens X connections at that point, but the problem
+predates it: it was first written down on 2026-10-09, and the layer came a day later.
+
+**Fix:** [`src/fdguard/fdguard.c`](../src/fdguard/fdguard.c), preloaded into the bottle's
+Wine processes (`LD_PRELOAD`, set by `install.sh`). It remembers, by inode, the pipes
+ntdll.so creates, and the first one it receives at start-up. While an fd is still that
+pipe, it refuses `close()`, `dup2()`, `dup3()`, `close_range()` and `closefrom()` from any
+other code: `close()` returns 0 without closing, `dup2`/`dup3` fail with `EBUSY`, and the
+`close_range` family skip the fd. A double close then does nothing. The caller is told
+apart by its return address, so ntdll's own closes always go through.
+
+Each refusal goes to `<bottle>/altium-on-linux/logs/fd-guard.log` and to stderr (so into
+`debug-launch.sh`'s log), with a backtrace that names the code that tried. ntdll.so
+closing a pipe is also logged if the pipe is not the calling thread's own and is more
+than five seconds old. The thread's own pipes are found in its TEB, next to its
+`pthread_self()`, and a native thread shares its creator's TEB, so its ID tells the two
+apart. That catches a close through Wine itself, for example its fd cache holding a stale
+number. `ALTIUM_FD_GUARD=log` only logs, `=off` turns the guard off.
+
+What the guard cannot see:
+
+- glibc's internal closes (`fclose`, `closedir`) and raw system calls.
+- 32-bit Wine processes: the library is 64-bit, and ld.so skips it with a `wrong ELF
+  class` message. Altium is 64-bit.
+- Other fds lost the same way, such as one behind a Windows handle in Wine's fd cache.
+  The guard leaves those alone on purpose, because their owners can legitimately be
+  other code.
+
+Tests:
+
+- [`tests/test_fdguard.py`](../tests/test_fdguard.py) checks twelve cases on the host,
+  with a stand-in `ntdll.so` and fake TEBs: stray closes, Wine's own closes (new pipes,
+  thread exits, another thread's pipe, a borrowed TEB), stale numbers, `dup2`/`dup3`,
+  `close_range`/`closefrom`, the received pipe, forks, and the log and off modes.
+- [`tests/test_fdguard_wine.py`](../tests/test_fdguard_wine.py) runs a Windows program in
+  the bottle's running session. The program starts and ends 320 threads; the log shows no
+  complaint about Wine's own closes. Then a native library closes every pipe in the
+  process while a worker thread talks to wineserver. With the guard, the 8 server-pipe
+  closes are refused, the worker makes 243 more calls, and the main thread and 64 new
+  threads work. Without it (`--control`), the program dies.
+
+Not done yet: confirming over long Altium sessions that the freezes are gone, and fixing
+whatever the guard's log names as the culprit at its source.

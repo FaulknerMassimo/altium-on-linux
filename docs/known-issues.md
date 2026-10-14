@@ -56,6 +56,12 @@ Altium with `scripts/debug-launch.sh` and close the lid or unplug a monitor.
 
 ## Intermittent freeze while a project loads
 
+Cause found on 2026-10-14: the thread that vanished had lost its pipes to wineserver to a
+stray close by native code ([how-it-works §20](how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver)).
+The fd guard that `install.sh` installs since then refuses those closes. If Altium still
+freezes like this, look in `<bottle>/altium-on-linux/logs/fd-guard.log` first: a
+`refused stray close` there names the code that tried.
+
 Seen three times: the documents appear but nothing responds, and the UI thread uses no
 CPU. The first two times, managed stacks (`scripts/dotnet-stacks.sh`) showed the UI thread
 in
@@ -102,10 +108,14 @@ To spot it and get Altium going again without a restart (this worked on 2026-10-
    Attaching interrupts the waits; when the threads resume, the kernel restarts each
    wait, which now finds the lock free, and the threads take it in turn.
 
-Next step: run Altium from `scripts/debug-launch.sh` until it happens again, and look for
-`wine client error` in the log just before the freeze.
+The same check finds a thread whose pipes were taken over (the 2026-10-14 case): compare
+the inodes of each thread's server fds, read from its TEB (debugging.md).
 
 ## Lost connection to wineserver
+
+These are the stray closes of [how-it-works §20](how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver),
+which the fd guard now refuses; its log (`fd-guard.log`) has a backtrace for each. The
+notes below are from before the guard.
 
 The log shows `wine client error:<thread id>: write: Bad file descriptor` (or `read:`): the
 pipe between a thread and wineserver was closed under it, and that thread dies. Altium then
@@ -124,9 +134,8 @@ threads wait for the loader lock and for an Altium critical section
   it, and neither did the 18 runs logged before. How an import could close another thread's
   file descriptor is not known; this may be chance.
 
-Next step: build the proxy with `user32.dll` imported again, start Altium with
-`scripts/debug-launch.sh`, attach `strace -f -e trace=close,dup2,dup3` to X2.EXE and wait two
-minutes, to see which code closes the pipe.
+Next step: read `fd-guard.log` after sessions in which this would have happened, and fix
+the code its backtraces name.
 
 ## Installer sign-in opens no browser
 

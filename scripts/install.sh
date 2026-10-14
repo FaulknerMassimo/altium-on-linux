@@ -78,6 +78,12 @@ say "Installing the present-wait Vulkan layer into $STAGE/vulkan"
 run mkdir -p "$STAGE/vulkan"
 run cp "$ROOT/build/VkLayer_altium_present_wait.so" "$ROOT/src/presentwait/VkLayer_altium_present_wait.json" "$STAGE/vulkan/"
 
+# Preloaded into the bottle's Wine processes (LD_PRELOAD, set below): keeps native code from
+# closing Wine's server pipes, which froze Altium. Logs to $STAGE/logs/fd-guard.log.
+say "Installing the fd guard into $STAGE/fdguard"
+run mkdir -p "$STAGE/fdguard" "$STAGE/logs"
+run cp "$ROOT/build/altium_fd_guard.so" "$STAGE/fdguard/"
+
 run cp "$ROOT/registry/altium-fixes.reg" "$STAGE/"
 regs=(altium-fixes.reg)
 
@@ -120,6 +126,7 @@ say "Setting bottle environment variables"
 quiet flatpak run --command=bottles-cli "$APP" edit -b "$BOTTLE" --env-var DOTNET_SYSTEM_GLOBALIZATION_USENLS=1
 quiet flatpak run --command=bottles-cli "$APP" edit -b "$BOTTLE" --env-var SteamAppId=altium
 quiet flatpak run --command=bottles-cli "$APP" edit -b "$BOTTLE" --env-var VK_ADD_IMPLICIT_LAYER_PATH="$STAGE/vulkan"
+quiet flatpak run --command=bottles-cli "$APP" edit -b "$BOTTLE" --env-var LD_PRELOAD="$STAGE/fdguard/altium_fd_guard.so"
 
 if [ "$DRY" = 0 ]; then
     say "Checking"
@@ -132,6 +139,7 @@ if [ "$DRY" = 0 ]; then
     [ "${#install_keys[@]}" -eq 0 ] || check "browser sign-in" '"UnifiedLogin"="1"' "$BOTTLE_DIR/user.reg"
     check "SteamAppId" 'SteamAppId: altium' "$BOTTLE_DIR/bottle.yml"
     check "present-wait layer" "VK_ADD_IMPLICIT_LAYER_PATH: $STAGE/vulkan" "$BOTTLE_DIR/bottle.yml"
+    check "fd guard" "LD_PRELOAD: $STAGE/fdguard/altium_fd_guard.so" "$BOTTLE_DIR/bottle.yml"
 fi
 
 echo
