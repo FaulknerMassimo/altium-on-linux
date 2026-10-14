@@ -14,6 +14,17 @@ void fake_set_teb(void *t) { teb = t; }
 int fake_server_pipe(int fds[2]) { return pipe2(fds, O_CLOEXEC); }
 int fake_close(int fd) { return close(fd); }
 
+/* Like Wine's pthread_exit_wrapper(): alert_fd, then the server fds (request, reply,
+ * wait[0], wait[1] in fds), each close from its own call site. */
+void fake_exit_closes(int alert, const int fds[4])
+{
+    close(alert);
+    close(fds[2]);
+    close(fds[3]);
+    close(fds[1]);
+    close(fds[0]);
+}
+
 /* receive_fd: one fd sent over a socket, as wineserver sends the first request pipe. */
 int fake_receive_fd(int sock)
 {

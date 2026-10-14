@@ -23,6 +23,19 @@
  * seconds old is logged, so that a close through Wine itself (its handle-to-fd cache)
  * shows up too.
  *
+ * A close() that fails with EBADF is logged too: that is the double close that did no
+ * harm this time, because nothing had the number yet. One backtrace per call chain, then
+ * a line at its 2nd, 4th, 8th... time. It names the culprit long before it hits a pipe.
+ *
+ * Two such closes are Wine's own (soda-11.0-7, ValveSoftware/wine), and the library skips
+ * them, logging each one that would have closed an open fd:
+ * - Under fsync, a thread's alert_fd (right after its server fds in the TEB) holds an
+ *   fsync shared-memory index, not a fd, and the thread's exit closes it anyway:
+ *   whatever fd has that number goes, another thread's server pipe included. Skipped
+ *   unless the fd is an ntsync object (alert_fd's real meaning under ntsync); once a
+ *   thread exit has been seen, only from that call site.
+ * - crypt32.so fclose()s the certificate bundle, then close()s its fd again.
+ *
  * Only closes through the libc functions are seen: glibc's internal ones (fclose and
  * the like) and raw syscalls are not. A forked child is left alone.
  *
@@ -66,6 +79,9 @@
 #define DETAILED_EVENTS 100 /* with a backtrace; after that one line each, up to MAX_EVENTS */
 #define MAX_EVENTS 10000
 #define MAX_NTDLL_EVENTS 200 /* ntdll.so's own odd closes, counted apart so they cannot crowd out refusals */
+#define MAX_CHAINS 256       /* call chains of closes that failed with EBADF, each logged with a backtrace once */
+#define DETAILED_SKIPS 3     /* Wine's own bad closes are always the same code: few backtraces */
+#define CHAIN_FRAMES 8
 
 /* Inode of the pipe ntdll.so created behind each fd (0: none), and when (ns). */
 static uint64_t pipe_ino[MAX_FDS];
@@ -80,7 +96,13 @@ static char log_path[512];
 static int log_fd = -1;
 static uint64_t log_ino; /* the log file's inode: its fd may be closed under us too */
 static volatile int log_lock;
-static unsigned events, ntdll_events, blocked;
+static unsigned events, ntdll_events, skip_events, blocked, skipped;
+static size_t server_off; /* TEB offset of a thread's four server fds, once found (0: not yet) */
+static __thread int crypt32_fclosed; /* fd + 1 that crypt32.so just closed with fclose() */
+static const void *alert_site;                 /* where ntdll.so's thread exit closes alert_fd, once seen */
+static __thread const void *alert_candidate;   /* this thread's skipped alert_fd close, until ntdll.so's next */
+static uint64_t chain_key[MAX_CHAINS]; /* under log_lock */
+static unsigned chain_seen[MAX_CHAINS];
 
 static uint64_t now_ns(void)
 {
@@ -156,11 +178,40 @@ static int read_teb(size_t offset, void *buf, size_t size)
     return teb && read_self(&self, teb + TEB_SELF, sizeof(self)) && self == teb && read_self(buf, teb + offset, size);
 }
 
+static int marked(int fd);
+
+/* TEB offset of the calling thread's four server fds (request, reply, wait[0], wait[1];
+ * TEB+0x384 in soda-11.0-7): four ints in a row that are pipes ntdll.so made. Found once,
+ * from a thread whose pipes are all open; 0 until then. */
+static size_t server_fds_offset(void)
+{
+    size_t off = __atomic_load_n(&server_off, __ATOMIC_RELAXED);
+    unsigned char batch[TEB_BATCH_SIZE];
+    if (off || !read_teb(TEB_BATCH, batch, sizeof(batch))) return off;
+    for (size_t i = 0; i + 5 * sizeof(int) <= sizeof(batch); i += sizeof(int)) {
+        int v[4];
+        memcpy(v, batch + i, sizeof(v));
+        if (v[0] != v[1] && v[1] != v[2] && v[2] != v[3] && marked(v[0]) && marked(v[1]) && marked(v[2]) &&
+            marked(v[3])) {
+            __atomic_store_n(&server_off, TEB_BATCH + i, __ATOMIC_RELAXED);
+            return TEB_BATCH + i;
+        }
+    }
+    return 0;
+}
+
 /* Is fd one of the current thread's own server fds? Returns 1 if so, 0 if its TEB does
- * not hold it, -1 if the thread has no TEB. */
+ * not hold it, -1 if the thread has no TEB. Until the slots are known, any int in the
+ * thread's data counts. */
 static int own_server_fd(int fd)
 {
     unsigned char batch[TEB_BATCH_SIZE];
+    size_t off = server_fds_offset();
+    if (off) {
+        int v[4];
+        if (!read_teb(off, v, sizeof(v))) return -1;
+        return v[0] == fd || v[1] == fd || v[2] == fd || v[3] == fd;
+    }
     if (!read_teb(TEB_BATCH, batch, sizeof(batch))) return -1;
     for (size_t i = 0; i + sizeof(int) <= sizeof(batch); i += sizeof(int)) {
         int v;
@@ -192,14 +243,71 @@ static void out(const char *s, size_t n)
     syscall(SYS_write, 2, s, n);
 }
 
-/* own: for ntdll.so's own closes, what own_server_fd() said; 2 for the other reports. */
-static void report(const char *what, const char *op, int fd, const void *caller, int own)
+/* How many times this call chain has closed a closed fd, this time included (0: the
+ * table is full). Under log_lock. */
+static unsigned chain_seen_count(void *const *frames, int count)
+{
+    uint64_t key = 14695981039346656037ull; /* FNV-1a */
+    for (int i = 0; i < count && i < CHAIN_FRAMES; i++) key = (key ^ (uintptr_t)frames[i]) * 1099511628211ull;
+    for (unsigned i = 0; i < MAX_CHAINS; i++) {
+        if (!chain_key[i]) chain_key[i] = key;
+        if (chain_key[i] == key) return ++chain_seen[i];
+    }
+    return 0;
+}
+
+/* What fd is now: "pipe inode N" (with its age if ntdll.so made it), or where it points. */
+static void describe_fd(int fd, char *buf, size_t size)
+{
+    struct stat st;
+    char path[32];
+    if (syscall(SYS_fstat, fd, &st)) { snprintf(buf, size, "closed"); return; }
+    if (S_ISFIFO(st.st_mode) && (unsigned)fd < MAX_FDS && pipe_ino[fd] == st.st_ino)
+        snprintf(buf, size, "pipe inode %llu, %llu ms old", (unsigned long long)st.st_ino,
+                 (unsigned long long)((now_ns() - pipe_born[fd]) / 1000000));
+    else if (S_ISFIFO(st.st_mode)) snprintf(buf, size, "pipe inode %llu", (unsigned long long)st.st_ino);
+    else {
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+        long n = syscall(SYS_readlinkat, AT_FDCWD, path, buf, size - 1);
+        buf[n > 0 ? n : 0] = 0;
+        if (n <= 0) snprintf(buf, size, "not a pipe inode %llu", (unsigned long long)st.st_ino);
+    }
+}
+
+enum kind {
+    STRAY,         /* other code closing a server pipe */
+    NTDLL_NOT_OWN, /* ntdll.so closing a server pipe that is not the thread's own */
+    NTDLL_NO_TEB,  /* the same on a thread without a TEB */
+    DOUBLE_CLOSE,  /* a close that failed with EBADF */
+    SKIPPED,       /* one of Wine's own bad closes, skipped */
+};
+
+static void report(const char *what, const char *op, int fd, const void *caller, enum kind kind)
 {
     int saved = errno;
-    unsigned seq = own == 2 ? __atomic_fetch_add(&events, 1, __ATOMIC_RELAXED)
-                            : __atomic_fetch_add(&ntdll_events, 1, __ATOMIC_RELAXED);
-    if (seq >= (own == 2 ? MAX_EVENTS : MAX_NTDLL_EVENTS)) { errno = saved; return; }
+    unsigned seq = 0, max = 0, detail = 0;
+    switch (kind) {
+    case STRAY: seq = __atomic_fetch_add(&events, 1, __ATOMIC_RELAXED); max = MAX_EVENTS; detail = DETAILED_EVENTS; break;
+    case NTDLL_NOT_OWN:
+    case NTDLL_NO_TEB:
+        seq = __atomic_fetch_add(&ntdll_events, 1, __ATOMIC_RELAXED);
+        max = MAX_NTDLL_EVENTS;
+        detail = DETAILED_EVENTS / 10;
+        break;
+    case SKIPPED: seq = __atomic_fetch_add(&skip_events, 1, __ATOMIC_RELAXED); max = MAX_EVENTS; detail = DETAILED_SKIPS; break;
+    case DOUBLE_CLOSE: max = 1; break;
+    }
+    if (seq >= max) { errno = saved; return; }
+    void *frames[32];
+    int count = kind == DOUBLE_CLOSE ? backtrace(frames, 32) : 0; /* outside the lock: it may load libgcc_s */
+    int detailed = seq < detail;
+    unsigned seen = 0;
     while (__sync_lock_test_and_set(&log_lock, 1)) ;
+    if (kind == DOUBLE_CLOSE) {
+        seen = chain_seen_count(frames + 1, count - 1);
+        if (!seen || (seen & (seen - 1))) { __sync_lock_release(&log_lock); errno = saved; return; } /* 1, 2, 4, 8... */
+        detailed = seen == 1;
+    }
     open_log();
 
     char proc[17] = "", thread[17] = "", line[640];
@@ -212,31 +320,29 @@ static void report(const char *what, const char *op, int fd, const void *caller,
     prctl(PR_GET_NAME, thread);
     uint64_t wine_tid = 0;
     if (!read_teb(TEB_TID, &wine_tid, sizeof(wine_tid))) wine_tid = 0;
-    struct stat st;
-    char target[64] = "closed";
-    if (!syscall(SYS_fstat, fd, &st)) snprintf(target, sizeof(target), "%s inode %llu",
-                                               S_ISFIFO(st.st_mode) ? "pipe" : "not a pipe", (unsigned long long)st.st_ino);
+    char target[80];
+    if (kind == DOUBLE_CLOSE && seen == 1) snprintf(target, sizeof(target), "first time from this call chain");
+    else if (kind == DOUBLE_CLOSE) snprintf(target, sizeof(target), "%u times from this call chain", seen);
+    else describe_fd(fd, target, sizeof(target));
     Dl_info info = {0};
     dladdr(caller, &info);
     const char *mod = info.dli_fname ? strrchr(info.dli_fname, '/') : NULL;
-    uint64_t age = pipe_born[fd] ? (now_ns() - pipe_born[fd]) / 1000000 : 0;
     struct timespec rt;
     clock_gettime(CLOCK_REALTIME, &rt);
     struct tm tm;
     localtime_r(&rt.tv_sec, &tm);
     int n = snprintf(line, sizeof(line),
-                     "fd-guard %02d:%02d:%02d %.3f: %s %s fd %d (%s, %llu ms old) in %s pid %d, thread %ld \"%s\" (Wine %04llx%s), "
+                     "fd-guard %02d:%02d:%02d %.3f: %s %s fd %d (%s) in %s pid %d, thread %ld \"%s\" (Wine %04llx%s), "
                      "called from %s+%#lx\n",
-                     tm.tm_hour, tm.tm_min, tm.tm_sec, now_ns() / 1e9, what, op, fd, target, (unsigned long long)age, proc,
+                     tm.tm_hour, tm.tm_min, tm.tm_sec, now_ns() / 1e9, what, op, fd, target, proc,
                      getpid(), (long)syscall(SYS_gettid), thread, (unsigned long long)wine_tid,
-                     own == 2 ? "" : own < 0 ? ", no TEB" : ", fd not in its TEB",
+                     kind == NTDLL_NO_TEB ? ", no TEB" : kind == NTDLL_NOT_OWN ? ", fd not in its TEB" : "",
                      mod ? mod + 1 : info.dli_fname ? info.dli_fname : "?",
                      (unsigned long)((uintptr_t)caller - (uintptr_t)info.dli_fbase));
     out(line, n < (int)sizeof(line) ? (size_t)n : sizeof(line) - 1);
 
-    if (seq < (own == 2 ? DETAILED_EVENTS : DETAILED_EVENTS / 10)) {
-        void *frames[32];
-        int count = backtrace(frames, 32);
+    if (detailed) {
+        if (!count) count = backtrace(frames, 32);
         for (int i = 1; i < count; i++) { /* frame 0 is report() */
             Dl_info fi = {0};
             dladdr(frames[i], &fi);
@@ -254,10 +360,11 @@ static void report(const char *what, const char *op, int fd, const void *caller,
 
 __attribute__((destructor)) static void fini(void)
 {
-    if (!blocked) return;
-    char line[160];
-    int n = snprintf(line, sizeof(line), "fd-guard: pid %d refused %u stray closes of Wine's server pipes\n", getpid(),
-                     blocked);
+    if (!blocked && !skipped) return;
+    char line[200];
+    int n = snprintf(line, sizeof(line),
+                     "fd-guard: pid %d refused %u stray closes of Wine's server pipes, skipped %u bad closes by Wine\n",
+                     getpid(), blocked, skipped);
     while (__sync_lock_test_and_set(&log_lock, 1)) ;
     open_log();
     out(line, n);
@@ -300,17 +407,74 @@ static int refuse(int fd, const void *caller, const char *op)
     if (in_ntdll(caller)) {
         int own;
         if (now_ns() - pipe_born[fd] >= fresh_ns && (own = own_server_fd(fd)) != 1)
-            report("ntdll.so, not its own thread's pipe:", op, fd, caller, own);
+            report("ntdll.so, not its own thread's pipe:", op, fd, caller, own < 0 ? NTDLL_NO_TEB : NTDLL_NOT_OWN);
         unmark(fd);
         return 0;
     }
     if (mode == 1) {
-        report("let through stray", op, fd, caller, 2);
+        report("let through stray", op, fd, caller, STRAY);
         unmark(fd);
         return 0;
     }
     __atomic_fetch_add(&blocked, 1, __ATOMIC_RELAXED);
-    report("refused stray", op, fd, caller, 2);
+    report("refused stray", op, fd, caller, STRAY);
+    return 1;
+}
+
+/* ---- Wine's own bad closes ---------------------------------------------------- */
+
+static int in_module(const void *addr, const char *name)
+{
+    Dl_info info;
+    if (!dladdr(addr, &info) || !info.dli_fname) return 0;
+    const char *base = strrchr(info.dli_fname, '/');
+    return !strcmp(base ? base + 1 : info.dli_fname, name);
+}
+
+/* Is this ntdll.so's thread exit closing the thread's alert_fd while it holds an fsync
+ * index (get_inproc_alert_fd() stores reply->fsync_shm_idx in it)? alert_fd follows the
+ * four server fds. Under ntsync it is an ntsync event, and closing it is right.
+ * Once a thread exit has been seen (the alert_fd close, then the thread's own wait_fd[0]),
+ * only closes from that call site count: other closes by ntdll.so of the same number are
+ * Wine's fd cache at work. */
+static int closes_fsync_index(int fd, const void *caller)
+{
+    size_t off;
+    int alert;
+    char link[64], path[32];
+    const void *site = __atomic_load_n(&alert_site, __ATOMIC_RELAXED);
+    if ((site && caller != site) || !in_ntdll(caller) || !(off = server_fds_offset()) ||
+        !read_teb(off + 4 * sizeof(int), &alert, sizeof(alert)) || alert != fd)
+        return 0;
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    long n = syscall(SYS_readlinkat, AT_FDCWD, path, link, sizeof(link) - 1);
+    link[n > 0 ? n : 0] = 0;
+    if (strstr(link, "ntsync")) return 0;
+    if (!site) alert_candidate = caller;
+    return 1;
+}
+
+/* After a skipped alert_fd close, ntdll.so's next close on the thread: if it is the
+ * thread's own wait_fd[0], that was the thread exit, and its call site is the one. */
+static void confirm_alert_site(int fd, const void *caller)
+{
+    int wait0;
+    size_t off = server_fds_offset();
+    if (caller != alert_candidate && in_ntdll(caller) && off && read_teb(off + 2 * sizeof(int), &wait0, sizeof(wait0)) &&
+        wait0 == fd)
+        __atomic_store_n(&alert_site, alert_candidate, __ATOMIC_RELAXED);
+    alert_candidate = NULL;
+}
+
+/* Skip one of Wine's bad closes (in log mode, let it through). Logged when the fd is open:
+ * then it was some other code's. */
+static int skip_close(int fd, const void *caller, const char *what)
+{
+    char line[160];
+    snprintf(line, sizeof(line), "%s %s:", mode == 1 ? "let through" : "skipped", what);
+    if (syscall(SYS_fcntl, fd, F_GETFD) != -1) report(line, "close of", fd, caller, SKIPPED);
+    if (mode == 1) return 0;
+    __atomic_fetch_add(&skipped, 1, __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -354,8 +518,36 @@ EXPORT ssize_t recvmsg(int fd, struct msghdr *msg, int flags)
 
 EXPORT int close(int fd)
 {
-    if (refuse(fd, __builtin_return_address(0), "close of")) return 0;
-    return syscall(SYS_close, fd);
+    const void *caller = __builtin_return_address(0);
+    if (fd >= 0 && mode != 2 && guard_pid && getpid() == guard_pid) {
+        if (crypt32_fclosed && crypt32_fclosed == fd + 1) {
+            crypt32_fclosed = 0;
+            if (in_module(caller, "crypt32.so") && skip_close(fd, caller, "crypt32.so's second close of a fclose()d fd"))
+                return 0;
+        }
+        if (alert_candidate) confirm_alert_site(fd, caller);
+        if (closes_fsync_index(fd, caller) && skip_close(fd, caller, "ntdll.so's thread-exit close of an fsync index (alert_fd)"))
+            return 0;
+    }
+    if (refuse(fd, caller, "close of")) return 0;
+    long ret = syscall(SYS_close, fd);
+    /* Only in a Wine process (it has made server pipes), not in a forked child that closes
+     * every number before exec. */
+    if (ret && errno == EBADF && fd >= 0 && mode != 2 && guard_pid && getpid() == guard_pid)
+        report("double close:", "close of", fd, caller, DOUBLE_CLOSE);
+    return ret;
+}
+
+/* crypt32.so's import_certs_from_file() fclose()s the fd that import_certs_from_path()
+ * then closes: note the fd for close(). */
+EXPORT int fclose(FILE *fp)
+{
+    static int (*real_fclose)(FILE *);
+    if (!real_fclose) real_fclose = (int (*)(FILE *))dlsym(RTLD_NEXT, "fclose");
+    int fd = mode != 2 ? fileno(fp) : -1;
+    int ret = real_fclose(fp);
+    if (fd >= 0 && guard_pid && in_module(__builtin_return_address(0), "crypt32.so")) crypt32_fclosed = fd + 1;
+    return ret;
 }
 
 EXPORT int dup2(int old, int new)

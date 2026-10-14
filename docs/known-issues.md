@@ -54,13 +54,19 @@ was left a zombie, with the rest of that Wine session still running and no wines
 Its output was not logged, so whether this was the cause is not known. To find out, run
 Altium with `scripts/debug-launch.sh` and close the lid or unplug a monitor.
 
+A monitor that comes back at 0x0 (a dock reconnecting) is a different problem, fixed:
+[how-it-works §21](how-it-works.md#21-a-monitor-stuck-at-0x0-altium-shows-no-window-or-loses-them-all).
+
 ## Intermittent freeze while a project loads
 
 Cause found on 2026-10-14: the thread that vanished had lost its pipes to wineserver to a
-stray close by native code ([how-it-works §20](how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver)).
-The fd guard that `install.sh` installs since then refuses those closes. If Altium still
-freezes like this, look in `<bottle>/altium-on-linux/logs/fd-guard.log` first: a
-`refused stray close` there names the code that tried.
+stray close, and the closes come from Wine itself. Under fsync, every thread that ends
+closes the fd whose number is its fsync index
+([how-it-works §20](how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver)).
+The fd guard that `install.sh` installs skips those closes and refuses stray closes of the
+pipes by other code. If Altium still freezes like this, look in
+`<bottle>/altium-on-linux/logs/fd-guard.log` first: `refused stray close`, `skipped` and
+`double close` lines name the code involved.
 
 Seen three times: the documents appear but nothing responds, and the UI thread uses no
 CPU. The first two times, managed stacks (`scripts/dotnet-stacks.sh`) showed the UI thread
@@ -113,9 +119,12 @@ the inodes of each thread's server fds, read from its TEB (debugging.md).
 
 ## Lost connection to wineserver
 
-These are the stray closes of [how-it-works §20](how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver),
-which the fd guard now refuses; its log (`fd-guard.log`) has a backtrace for each. The
-notes below are from before the guard.
+These are the stray closes of [how-it-works §20](how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver):
+mostly Wine's own thread exits closing an fsync index as if it were a fd, which the fd
+guard now skips (and logs, with what the fd was). The notes below are from before the
+cause was found. Both observations fit it: DXVK starts and ends threads when it creates a
+device or swapchain, and the second one came right after a burst of worker threads
+ended.
 
 The log shows `wine client error:<thread id>: write: Bad file descriptor` (or `read:`): the
 pipe between a thread and wineserver was closed under it, and that thread dies. Altium then
@@ -134,8 +143,8 @@ threads wait for the loader lock and for an Altium critical section
   it, and neither did the 18 runs logged before. How an import could close another thread's
   file descriptor is not known; this may be chance.
 
-Next step: read `fd-guard.log` after sessions in which this would have happened, and fix
-the code its backtraces name.
+Next step: confirm over long sessions that no `wine client error` comes back, and report
+the Wine bug upstream (ValveSoftware/wine).
 
 ## Installer sign-in opens no browser
 

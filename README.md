@@ -25,7 +25,8 @@ redistributed here.
 | Heads-up display in the PCB view | fixed ([§14](docs/how-it-works.md#14-heads-up-display-frozen-in-the-pcb-view-layered-child-windows)); drawn over black rather than blended with the board |
 | Two monitors with different scaling | Altium's windows open on the external monitor ([§17](docs/how-it-works.md#17-windows-split-across-monitors-hyprland-mixed-scaling)); moving them to the laptop screen, or starting Altium from it, still misplaces them ([known issues](docs/known-issues.md#windows-misplaced-on-the-other-monitor-mixed-scaling)) |
 | Closing the lid, switching a monitor off and on | Altium follows the new layout ([§19](docs/how-it-works.md#19-altium-drawn-offset-after-a-monitor-goes-away-and-comes-back)); needs the Hyprland hook |
-| Freezes now and then (a Wine thread loses its pipes to wineserver) | stray closes of those pipes refused and logged since 2026-10-14 ([§20](docs/how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver)); not yet confirmed over long sessions, and the code that closes them is not found yet |
+| Freezes now and then (a Wine thread loses its pipes to wineserver) | cause found: under fsync, Wine closes a random fd each time a thread ends; the fd guard skips those closes ([§20](docs/how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver)); not yet confirmed over long sessions |
+| A monitor stuck at 0x0 (a dock reconnecting) | hidden from Wine, which divided by its width and lost Altium's windows ([§21](docs/how-it-works.md#21-a-monitor-stuck-at-0x0-altium-shows-no-window-or-loses-them-all)) |
 
 The full list, with what is known about each, is in [docs/known-issues.md](docs/known-issues.md).
 
@@ -66,7 +67,8 @@ Hyprland rules only matter on Hyprland.
 | 17 | Two monitors at different scales (Hyprland): splash split across them, Messages panel on the other screen | external monitor made X11's primary, so Wine and Altium put their windows there |
 | 18 | Schematic redraws slow (24 a second on a large sheet) | `SHFolder.dll` proxy skips Wine's Direct3D state swaps around every Direct2D shape |
 | 19 | After a monitor goes away and comes back (closed lid, monitor off): Altium drawn offset, dialogs off-screen, a monitor lost | registry: `EmulateModeset=N`; Hyprland hook resyncs Wine's monitor list (`scripts/refresh-displays.sh`) |
-| 20 | Altium freezes now and then: no redraws, no input (`wine client error … Bad file descriptor` earlier in the log) | fd guard (`LD_PRELOAD`) keeps native code from closing the pipes Wine's threads use to talk to wineserver, and logs who tried |
+| 20 | Altium freezes now and then: no redraws, no input (`wine client error … Bad file descriptor` earlier in the log) | fd guard (`LD_PRELOAD`) skips Wine's own closes of fds it does not own (under fsync, each ending thread closes a random fd), keeps other code off the pipes Wine's threads use to talk to wineserver, and logs both |
+| 21 | A monitor stuck at 0x0 (dock reconnecting): Altium starts with no window or loses all its windows, `explorer.exe` at 100% CPU | XRandR filter (`LD_PRELOAD`) hides outputs whose CRTC is 0x0 from Wine |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.
@@ -172,17 +174,17 @@ and you can use your license.
 | `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text, layered windows, Direct2D arcs, stale panel focus | 9, 10, 12, 13, 14, 15, 16 |
 | `Program Files\Altium\AD26\dxvk.conf` | `dxgi.syncInterval = 0` | 11 |
 | `<bottle>/altium-on-linux/vulkan/` | Vulkan layer (Linux library and manifest) that waits for each present | 11 |
-| `<bottle>/altium-on-linux/fdguard/` | fd guard (Linux library, preloaded into the bottle's Wine processes); logs to `<bottle>/altium-on-linux/logs/fd-guard.log` | 20 |
+| `<bottle>/altium-on-linux/fdguard/` | fd guard and XRandR filter (Linux libraries, preloaded into the bottle's Wine processes); log to `<bottle>/altium-on-linux/logs/fd-guard.log` and `xrandr-filter.log` | 20, 21 |
 | `windows\Fonts\segoeui-selawik*.ttf` | Selawik renamed to "Segoe UI", built locally from Microsoft's release | 8 |
 | `HKCU\Software\Wine\DllOverrides` | `tabtip.exe` disabled | 4 |
 | `HKCU\Software\Wine\AppDefaults\X2.EXE\DllOverrides` | `shfolder` = `native,builtin` | 9, 10, 12, 13, 14, 15 |
 | `HKCU\Software\Microsoft\Avalon.Graphics` | WPF software rendering | 4 |
 | `HKCU\Software\Altium\Altium Designer {…}\…\AltiumPortal\Account` | `UnifiedLogin` = `1` | 5 |
 | `HKLM\…\Fonts`, `HKCU\Control Panel\Desktop` | register the fonts, RGB font smoothing | 8 |
-| `bottle.yml` | `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1`, `SteamAppId=altium`, `VK_ADD_IMPLICIT_LAYER_PATH=<bottle>/altium-on-linux/vulkan`, `LD_PRELOAD=<bottle>/altium-on-linux/fdguard/altium_fd_guard.so` | 1, 2, 11, 20 |
+| `bottle.yml` | `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1`, `SteamAppId=altium`, `VK_ADD_IMPLICIT_LAYER_PATH=<bottle>/altium-on-linux/vulkan`, `LD_PRELOAD=<bottle>/altium-on-linux/fdguard/altium_fd_guard.so:<bottle>/altium-on-linux/fdguard/altium_xrandr_filter.so` | 1, 2, 11, 20, 21 |
 
 The shims are freestanding C (no C runtime, no Windows headers), the Vulkan layer is
-plain C without Vulkan headers and the fd guard plain C, all built with `scripts/build.sh`; each source file
+plain C without Vulkan headers and the fd guard and XRandR filter plain C, all built with `scripts/build.sh`; each source file
 explains what it does and why.
 
 **After updating Altium** to a new major version (a new `AD27` folder), run
@@ -210,8 +212,10 @@ harmless to keep.
 | `scripts/profile.py` | sampling profiler for Altium's UI thread (modules, functions, system calls) |
 | `tests/test_rsa.py` | checks the raw RSA code against Python on random keys |
 | `tests/test_arc.py` | checks the Direct2D arc code on random arcs |
-| `tests/test_fdguard.py` | checks the fd guard on the host, with a stand-in `ntdll.so` |
-| `tests/test_fdguard_wine.py` | checks the fd guard in a Wine process of the running bottle |
+| `tests/test_fdguard.py` | checks the fd guard on the host, with stand-in `ntdll.so` and `crypt32.so` |
+| `tests/test_fdguard_wine.py` | checks the fd guard in a Wine process of the running bottle, and reproduces Wine's fsync close bug |
+| `tests/test_xrandrfilter.py` | checks the XRandR filter on the host, with a stand-in libXrandr |
+| `tests/test_xrandrfilter_wine.py` | reproduces Wine's divide by zero on a 0x0 monitor in a throwaway prefix, and checks the filter |
 
 ## Repository layout
 
@@ -225,8 +229,9 @@ src/cmdshim/     cmd.exe shim
 src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA, Direct2D text, layered windows, Direct2D arcs, VCL focus)
 src/presentwait/ Vulkan layer that waits for each present (Linux)
 src/fdguard/     LD_PRELOAD library that protects Wine's server pipes (Linux)
+src/xrandrfilter/  LD_PRELOAD library that hides 0x0 monitors from Wine (Linux)
 src/tools/       wininfo.exe, clearex.exe, postmsg.exe (diagnostics), displayfix.exe (monitor list)
-tests/           raw RSA, Direct2D arc and fd guard tests
+tests/           raw RSA, Direct2D arc, fd guard and XRandR filter tests
 ```
 
 ## License

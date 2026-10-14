@@ -10,10 +10,18 @@
  * main thread and new threads can still talk to wineserver. Without the guard, the
  * threads lose their pipes and die or hang.
  *
+ * With FDPOKE_MODE=alert: once the poke library has put canary fds on every free number
+ * (FDPOKE_READY_WIN appears), runs 200 threads that each make one alertable wait and end,
+ * then creates FDPOKE_CHECK_WIN. Under fsync, each such thread's exit closes the fd whose
+ * number is its fsync index (Wine's alert_fd bug), which the poke library then counts.
+ * 20 more threads wait alertably once and are still there at exit, when Wine ends them
+ * from a signal handler (abort_thread): the guard's log shows whether it saw those too.
+ *
  * Environment: FDPOKE_TRIGGER_WIN, FDPOKE_DONE_WIN: Windows paths of the files that start
  * the poke (created here) and report it done (created by the poke library);
  * FDPOKE_RESULT_WIN: where to write what happened (not stdout: when it is a pipe, the poke
- * closes Wine's copy of it too, which the guard rightly leaves alone).
+ * closes Wine's copy of it too, which the guard rightly leaves alone); FDPOKE_MODE,
+ * FDPOKE_READY_WIN, FDPOKE_CHECK_WIN.
  */
 typedef void *HANDLE;
 typedef unsigned long DWORD;
@@ -29,6 +37,7 @@ IMPORT HANDLE WINAPI GetStdHandle(DWORD which);
 IMPORT int WINAPI WriteFile(HANDLE file, const void *buf, DWORD size, DWORD *written, void *overlapped);
 IMPORT __declspec(noreturn) void WINAPI ExitProcess(unsigned code);
 IMPORT void WINAPI Sleep(DWORD ms);
+IMPORT DWORD WINAPI SleepEx(DWORD ms, int alertable);
 IMPORT HANDLE WINAPI CreateThread(void *attr, unsigned long long stack, DWORD (WINAPI *start)(void *), void *arg,
                                   DWORD flags, DWORD *id);
 IMPORT DWORD WINAPI WaitForSingleObject(HANDLE handle, DWORD ms);
@@ -102,6 +111,60 @@ static DWORD WINAPI worker(void *arg)
     return 0;
 }
 
+static DWORD WINAPI alertable_thread(void *arg)
+{
+    (void)arg;
+    SleepEx(1, 1);
+    return 0;
+}
+
+/* Still waiting when the program exits: its exit runs from wineserver's kill signal. */
+static DWORD WINAPI lingering_thread(void *arg)
+{
+    (void)arg;
+    SleepEx(1, 1);
+    Sleep(0xffffffff);
+    return 0;
+}
+
+static int create_file(const WCHAR *path)
+{
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0);
+    if (file == (HANDLE)-1) return 0;
+    CloseHandle(file);
+    return 1;
+}
+
+/* FDPOKE_MODE=alert: see the top of the file. */
+static void alert_test(const WCHAR *trigger, const WCHAR *done)
+{
+    WCHAR ready[512], check[512];
+    if (!GetEnvironmentVariableW(L"FDPOKE_READY_WIN", ready, 512) || !GetEnvironmentVariableW(L"FDPOKE_CHECK_WIN", check, 512)) {
+        print("FDPOKE_READY_WIN and FDPOKE_CHECK_WIN must be set\n");
+        ExitProcess(2);
+    }
+    if (!create_file(trigger)) { print("cannot create the trigger file\n"); ExitProcess(2); }
+    int waited = 0;
+    while (GetFileAttributesW(ready) == INVALID_FILE_ATTRIBUTES && waited < 30000) { Sleep(10); waited += 10; }
+    if (waited >= 30000) { print("canaries: never laid\n"); ExitProcess(1); }
+    for (int i = 0; i < 20; i++) CloseHandle(CreateThread(0, 0, lingering_thread, 0, 0, 0));
+    int ended = 0;
+    for (int done = 0; done < 200; done += 50) {
+        HANDLE threads[50];
+        for (int i = 0; i < 50; i++) threads[i] = CreateThread(0, 0, alertable_thread, 0, 0, 0);
+        for (int i = 0; i < 50; i++) {
+            if (!threads[i]) continue;
+            if (WaitForSingleObject(threads[i], 10000) == WAIT_OBJECT_0) ended++;
+            CloseHandle(threads[i]);
+        }
+    }
+    Sleep(200); /* the last threads' exits run after their handles are signaled */
+    create_file(check);
+    for (waited = 0; GetFileAttributesW(done) == INVALID_FILE_ATTRIBUTES && waited < 30000; waited += 10) Sleep(10);
+    print_num("alert threads: ", ended, " of 200 ended\n");
+    ExitProcess(ended == 200 ? 0 : 1);
+}
+
 /* Start `count` threads, `batch` at a time; how many ended normally. */
 static int churn(int count, int batch)
 {
@@ -127,6 +190,8 @@ void start_entry(void)
         ExitProcess(2);
     }
     result = CreateFileW(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0);
+    WCHAR mode[16];
+    if (GetEnvironmentVariableW(L"FDPOKE_MODE", mode, 16) && mode[0] == 'a') alert_test(trigger, done);
     HANDLE long_threads[4];
     for (int i = 0; i < 4; i++) long_threads[i] = CreateThread(0, 0, long_thread, 0, 0, 0);
     print_num("churn: ", churn(320, 32), " of 320 threads ok\n");

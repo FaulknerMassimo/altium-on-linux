@@ -12,3 +12,4 @@ SetEvent
 GetEnvironmentVariableW
 GetFileAttributesW
 CreateFileW
+SleepEx

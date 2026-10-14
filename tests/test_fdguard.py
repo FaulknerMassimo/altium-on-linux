@@ -6,7 +6,13 @@ name) and tests/test_fdguard.c, then runs each scenario with the guard preloaded
 close (by code outside ntdll.so) of a pipe ntdll.so made must be refused and logged with a
 backtrace; dup2/dup3 onto one must fail with EBUSY; close_range and closefrom must skip
 them, and so must the first pipe ntdll.so receives over a socket (the first thread's
-request pipe, sent by wineserver) but no later one. ntdll.so's own closes must go through: silently when the pipe is new or the thread's
+request pipe, sent by wineserver) but no later one. A close that fails with EBADF (a double
+close that hit nothing) must be logged, with a backtrace once per call chain, except in a
+process that is not Wine's or a forked child. Wine's own bad closes must be skipped: a
+thread's exit closing its alert_fd (after its server fds) when that holds an fsync index
+rather than an ntsync object, logged when the number was another open fd, but not
+ntdll.so closing that number elsewhere once a thread exit has shown where the exit's
+close is; and a stand-in crypt32.so closing a fd it has already fclose()d. ntdll.so's own closes must go through: silently when the pipe is new or the thread's
 own (its TEB, from NtCurrentTeb, holds it), logged when it is another thread's or the
 thread has no TEB (or NtCurrentTeb returns something that is not one). A fd
 whose pipe went away unseen, a forked child, and ALTIUM_FD_GUARD=log/off are left alone.
@@ -43,6 +49,19 @@ CASES = {
                     [("refused stray close_range of", 8)]),
     "received": ({}, "received: first close 0 open 1, later close 0 open 0\n", [("refused stray close of fd", 1)]),
     "fork": ({}, "fork: child closed 1, parent open 1\n", []),
+    "double": ({}, "double: close -1 EBADF, close(-1) -1, child 1\n",
+               [("double close: close of fd", 4), ("first time from this call chain", 2), ("2 times from", 1), ("4 times from", 1),
+                (r"#\d+ altium_fd_guard\.so\+0x[0-9a-f]+ \(close\)\n.*#\d+ test_fdguard\+", 2)]),
+    "double-native": ({}, "double-native: close -1\n", []),
+    "alert": ({}, "alert: other open 1, ntsync open 0, same number elsewhere open 0, own pipes closed 16\n",
+              [(r"skipped ntdll.so's thread-exit close of an fsync index \(alert_fd\): close of fd \d+ \(/dev/null\)", 1),
+               ("fd-guard [0-9]", 1)]),
+    "alert/log": ({"ALTIUM_FD_GUARD": "log"},
+                  "alert: other open 0, ntsync open 0, same number elsewhere open 0, own pipes closed 16\n",
+                  [("let through ntdll.so's thread-exit close of an fsync index", 1), ("double close: close of", 1)]),
+    "crypt32": ({}, "crypt32: close 0, other open 1, close 0; elsewhere close -1\n",
+                [(r"skipped crypt32.so's second close of a fclose\(\)d fd: close of fd \d+ \(/dev/null\)", 1),
+                 (r"double close: close of fd \d+ \(first time.*called from test_fdguard\+", 1), ("fd-guard [0-9]", 2)]),
 }
 
 
@@ -52,10 +71,13 @@ def build(tmp):
     exe = os.path.join(tmp, "test_fdguard")
     subprocess.run([CC, "-shared", "-fPIC", "-fvisibility=hidden", *FLAGS, "-o", guard,
                     os.path.join(ROOT, "src/fdguard/fdguard.c")], check=True)
+    crypt32 = os.path.join(tmp, "crypt32.so")
     # Calls, not tail jumps, as in Wine's ntdll.so: the guard goes by the return address.
     subprocess.run([CC, "-shared", "-fPIC", "-fno-optimize-sibling-calls", *FLAGS, "-o", lib,
                     os.path.join(ROOT, "tests/fdguard_ntdll.c")], check=True)
-    subprocess.run([CC, *FLAGS, "-pthread", "-o", exe, os.path.join(ROOT, "tests/test_fdguard.c"), lib,
+    subprocess.run([CC, "-shared", "-fPIC", "-fno-optimize-sibling-calls", *FLAGS, "-o", crypt32,
+                    os.path.join(ROOT, "tests/fdguard_crypt32.c")], check=True)
+    subprocess.run([CC, *FLAGS, "-pthread", "-o", exe, os.path.join(ROOT, "tests/test_fdguard.c"), lib, crypt32,
                     "-Wl,-rpath," + tmp], check=True)
     return guard, exe
 

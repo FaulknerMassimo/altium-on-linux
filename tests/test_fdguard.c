@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -21,6 +22,8 @@ int fake_server_pipe(int fds[2]);
 int fake_close(int fd);
 int fake_receive_fd(int sock);
 void fake_set_teb(void *teb);
+int fake_import_certs(const char *path, void (*between)(void));
+void fake_exit_closes(int alert, const int fds[4]);
 
 #define TEB_SELF 0x30
 #define TEB_TID 0x48
@@ -68,6 +71,16 @@ static void send_fd(int sock, int fd)
 
 static void set_teb(unsigned char *teb) { fake_set_teb(teb); }
 
+/* double: one call chain that closes a fd twice (not a tail call: the chain must be the
+ * same each time). */
+__attribute__((noinline)) static int close_twice(void)
+{
+    int fd = open("/dev/null", O_RDONLY);
+    close(fd);
+    volatile int r = close(fd);
+    return r;
+}
+
 /* own-exit: a thread closes its own pipes, as Wine's exit_thread does. */
 static void *own_exit(void *arg)
 {
@@ -79,6 +92,43 @@ static void *own_exit(void *arg)
     printf("own-exit: close %d %d, open %d %d\n", r0, r1, is_open(p[0]), is_open(p[1]));
     return NULL;
 }
+
+/* alert: threads exit under fsync, their alert_fd (after their server fds) holding an
+ * fsync index: some other fd's number, a closed number, an ntsync object (a memfd named
+ * so). Then ntdll.so closes that number elsewhere than in a thread exit. */
+enum alert_case { OTHER, GONE, NTSYNC, ELSEWHERE };
+static int alert_open[4], alert_own;
+
+static void *alert_exit(void *arg)
+{
+    enum alert_case c = (enum alert_case)(intptr_t)arg;
+    int a[2], b[2], alert = c == NTSYNC ? memfd_create("ntsync", 0) : open("/dev/null", O_RDONLY);
+    fake_server_pipe(a);
+    fake_server_pipe(b);
+    int fds[5] = { a[1], a[0], b[0], b[1], alert };
+    if (c == GONE) syscall(SYS_close, alert);
+    set_teb(make_teb(0x555 + c, fds, 5));
+    if (c == ELSEWHERE) { /* ntdll.so's fd cache closing the same number */
+        fake_close(alert);
+        alert_open[c] = is_open(alert);
+        alert = -1;
+    }
+    fake_exit_closes(alert, fds);
+    if (c != ELSEWHERE) alert_open[c] = is_open(alert);
+    for (int i = 0; i < 4; i++) alert_own += !is_open(fds[i]);
+    return NULL;
+}
+
+static void alert_thread(enum alert_case c)
+{
+    pthread_t t;
+    pthread_create(&t, NULL, alert_exit, (void *)(intptr_t)c);
+    pthread_join(t, NULL);
+}
+
+/* crypt32: another thread takes the number between crypt32.so's fclose() and close(). */
+static int taken = -1;
+static void take_number(void) { taken = open("/dev/null", O_RDONLY); }
 
 /* A thread that keeps its pipes in its TEB until told to finish. */
 static int other_pipe[2];
@@ -202,6 +252,37 @@ int main(int argc, char **argv)
         int later = fake_receive_fd(sock[1]);
         int r2 = close(later);
         printf("received: first close %d open %d, later close %d open %d\n", r1, is_open(first), r2, is_open(later));
+    } else if (!strcmp(s, "double")) {
+        /* Closing a closed fd (EBADF) is logged once per call chain with a backtrace, then
+         * at its 2nd, 4th... time; close(-1) and a forked child's are not. */
+        fake_server_pipe(p);
+        for (volatile int i = 0; i < 4; i++) close_twice(); /* volatile: not unrolled into 4 chains */
+        int fd = open("/dev/null", O_RDONLY);
+        close(fd);
+        int r = close(fd), e = errno;
+        int none = close(-1);
+        pid_t child = fork();
+        if (!child) _exit(close_twice() == -1 ? 0 : 1);
+        int status;
+        waitpid(child, &status, 0);
+        printf("double: close %d %s, close(-1) %d, child %d\n", r, e == EBADF ? "EBADF" : "?", none,
+               WIFEXITED(status) && !WEXITSTATUS(status));
+    } else if (!strcmp(s, "alert")) {
+        for (int c = OTHER; c <= ELSEWHERE; c++) alert_thread(c);
+        printf("alert: other open %d, ntsync open %d, same number elsewhere open %d, own pipes closed %d\n",
+               alert_open[OTHER], alert_open[NTSYNC], alert_open[ELSEWHERE], alert_own);
+    } else if (!strcmp(s, "crypt32")) {
+        /* crypt32.so's second close is skipped; the same pattern elsewhere is not. */
+        fake_server_pipe(p);
+        int r1 = fake_import_certs("/dev/null", take_number);
+        int r2 = fake_import_certs("/dev/null", NULL);
+        int fd = open("/dev/null", O_RDONLY);
+        fclose(fdopen(fd, "r"));
+        int r3 = close(fd);
+        printf("crypt32: close %d, other open %d, close %d; elsewhere close %d\n", r1, is_open(taken), r2, r3);
+    } else if (!strcmp(s, "double-native")) {
+        /* Not a Wine process (no server pipes): its closes are its own business. */
+        printf("double-native: close %d\n", close_twice());
     } else if (!strcmp(s, "fork")) {
         fake_server_pipe(p);
         pid_t child = fork();

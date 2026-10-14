@@ -108,8 +108,12 @@ probably lost its pipes ([how-it-works §20](how-it-works.md#20-freezes-wine-thr
   same fd number, or if wineserver no longer holds the pipe.
 - **The fd guard's log**, `<bottle>/altium-on-linux/logs/fd-guard.log` (also in the
   `debug-launch.sh` log): `refused stray close of fd N ... called from <module>+<offset>`
-  and a backtrace, for each close it refused. `ALTIUM_FD_GUARD=log` (with `--env`) lets
-  them through and only logs them.
+  and a backtrace, for each close it refused; `skipped ...` for each of Wine's own bad
+  closes that would have closed an open fd, with what that fd was; and `double close:`
+  for each call chain that closed a fd that was not open (`EBADF`), with a backtrace the
+  first time. That last kind is the quickest lead: a double close usually hits nothing,
+  so it shows up long before it hits something. `ALTIUM_FD_GUARD=log` (with `--env`) lets
+  every close through and only logs.
 
 ## Slow redraws: `scripts/redraw-bench.sh` and `scripts/profile.py`
 

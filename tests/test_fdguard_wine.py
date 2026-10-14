@@ -14,6 +14,13 @@ pipe is made, which the guard normally lets through.
 With --control, runs it once more without the guard, which must break (the program fails
 or hangs and is killed after 60 s): shows that the poke does what a stray close does.
 
+Then the alert test, in the session's own sync mode: the poke library puts a /dev/null
+canary on every free fd number, and 200 threads each make one alertable wait and end.
+Under fsync each such exit closes the fd numbered by the thread's fsync index (Wine's
+alert_fd bug); with the guard no canary may be closed, and the guard must log at least
+200 skipped closes (more when the 20 threads still waiting at exit get to theirs). With --control, the same run without the guard must lose canaries (under
+fsync; other sync modes do not have the bug).
+
 Needs a running session of the bottle (Altium, or any program started in it), so the
 test talks to the same wineserver and touches nothing else.
 
@@ -59,8 +66,15 @@ def build(work):
                     f"/out:{work}/fdguard_wine.exe", f"{work}/fdguard_wine.obj", f"{work}/kernel32.lib"], check=True)
 
 
-def run(bottle, runner, work, guard, timeout):
-    for name in ("trigger", "done", "result", "guard.log"):
+def session_sync(bottle):
+    """The running session's WINEFSYNC/WINEESYNC/WINENTSYNC settings, from wineserver."""
+    out = bash('load_bottle "$1"; tr "\\0" "\\n" < /proc/$(wineserver_pid)/environ', bottle,
+               capture_output=True, text=True).stdout
+    return [line for line in out.split("\n") if line.split("=")[0] in ("WINEFSYNC", "WINEESYNC", "WINENTSYNC")]
+
+
+def run(bottle, runner, work, guard, timeout, extra_env=()):
+    for name in ("trigger", "done", "result", "guard.log", "ready", "check"):
         if os.path.exists(f"{work}/{name}"):
             os.remove(f"{work}/{name}")
     preload = (f"{work}/altium_fd_guard.so:" if guard else "") + f"{work}/fdguard_poke.so"
@@ -68,7 +82,9 @@ def run(bottle, runner, work, guard, timeout):
            f"FDPOKE_TRIGGER={work}/trigger", f"FDPOKE_DONE={work}/done",
            f"FDPOKE_TRIGGER_WIN={winpath(work + '/trigger')}", f"FDPOKE_DONE_WIN={winpath(work + '/done')}",
            f"FDPOKE_RESULT_WIN={winpath(work + '/result')}",
-           "WINEDEBUG=-all"]
+           f"FDPOKE_READY={work}/ready", f"FDPOKE_CHECK={work}/check",
+           f"FDPOKE_READY_WIN={winpath(work + '/ready')}", f"FDPOKE_CHECK_WIN={winpath(work + '/check')}",
+           "WINEDEBUG=-all", *extra_env]
     proc = subprocess.Popen(["bash", "-c", f'source {LIB}; load_bottle "$1"; shift; in_running_bottle "$@"', "_",
                              bottle, *env, f"{runner}/bin/wine", winpath(f"{work}/fdguard_wine.exe")],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -124,6 +140,34 @@ def main():
                 print("FAIL without the guard: the poke did not break anything, so the test proves nothing")
             else:
                 print("ok   without the guard it breaks")
+
+        sync = session_sync(args.bottle)
+        fsync = "WINEFSYNC=1" in sync
+        alert_env = ["FDPOKE_MODE=alert", *sync]
+        for guard in (True, False) if args.control else (True,):
+            start = time.time()
+            code, out, done, log = run(args.bottle, runner, work, guard, 120, alert_env)
+            name = "alert test " + ("with the guard" if guard else "without the guard")
+            print(f"{name} ({' '.join(sync) or 'no fsync/esync/ntsync'}, {time.time() - start:.1f} s, exit {code}):")
+            print("    " + (out.strip() or "(no output)").replace("\n", "\n    ") + "\n    " + done)
+            closed = int(done.split()[2]) if done.startswith("canaries:") else -1
+            skipped = log.count("thread-exit close of an fsync index")
+            if guard:
+                print(f"    guard log: {skipped} skipped closes of an fsync index")
+                if code != 0 or closed != 0 or (fsync and skipped < 200):
+                    failures += 1
+                    print(f"FAIL {name}")
+                    if log:
+                        print("    " + "\n    ".join(log.strip().split("\n")[:20]))
+                else:
+                    print(f"ok   {name}")
+            elif not fsync:
+                print(f"skip {name}: the session does not use fsync, which has the bug")
+            elif closed > 0:
+                print(f"ok   {name}: thread exits closed {closed} unrelated fds")
+            else:
+                failures += 1
+                print(f"FAIL {name}: no canary was closed, so the test proves nothing")
         print("all passed" if not failures else f"{failures} failed")
         return 1 if failures else 0
     finally:

@@ -29,7 +29,8 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 17 | With two monitors: splash split across them, Messages panel on the other screen, too big | Hyprland misplaces X11 windows that open or move on a monitor other than the focused one when the monitors' scales differ; Wine's primary monitor is the laptop | external monitor made X11's primary (Hyprland hook) |
 | 18 | Schematic redraws slow (24 a second on a 346 KB sheet) | Wine's d2d1 swaps the whole Direct3D context state twice per shape, and DXVK copies and rebinds it every time | `SHFolder.dll` proxy skips the swaps while nothing else uses the context |
 | 19 | After a monitor goes away and comes back: Altium drawn offset and cropped, dialogs off-screen | Proton keeps each output's first recorded mode (emulated mode changes) and cannot repoint its per-slot registry links, so a reconnected monitor gets a stale size, a lost slot or a second primary | `EmulateModeset=N`; Hyprland hook runs `refresh-displays.sh`, which deletes the slot links so Wine rebuilds them |
-| 20 | Altium freezes now and then: no redraws, no input, the UI thread idle | native code in Altium's process closes file descriptors it does not own, among them the pipes Wine's threads use to talk to wineserver; a thread then waits forever, often holding a lock | fd guard (`LD_PRELOAD`) refuses closes of Wine's server pipes from other code and logs who tried |
+| 20 | Altium freezes now and then: no redraws, no input, the UI thread idle | under fsync, every Wine thread that ends closes the fd whose number is its fsync index (Wine's `alert_fd`), whatever that fd is: another thread's pipe to wineserver (that thread then waits forever, often holding a lock), the GPU device...; `crypt32` closes one fd twice | fd guard (`LD_PRELOAD`) skips those closes, refuses closes of Wine's server pipes from other code, and logs both |
+| 21 | A monitor stuck at 0x0 (a dock reconnecting): Altium starts with no window, or a running one loses all its windows; `explorer.exe` at 100% CPU, the log growing tens of MB/s | XWayland lists the monitor as connected with a 0x0 mode, and Proton's win32u divides by its width | XRandR filter (`LD_PRELOAD`) hides outputs whose CRTC is 0x0 from Wine |
 
 ## 1. ICU error in the installer
 
@@ -799,8 +800,8 @@ reply and two wait fds are four `int`s at TEB+0x384). On the Unix side, ntdll.so
 TEB through a pthread key (its exported `NtCurrentTeb` is `pthread_getspecific`), not the
 GS base: the GS base is already 0 while a thread exits, and native threads have no TEB.
 
-Something in the process closes some of those fds, most likely a double close: code
-closes its own fd, the number goes to a new thread's pipe, and the code closes it again.
+Something in the process closes some of those fds: code calls `close()` on a number that
+is not its fd (any more), and the number belongs to a thread's pipe.
 The owner then fails on its next request: `abort_thread` ends it, whatever locks it
 holds. Or the number is given out again, to another thread's pipe, before the owner
 notices. The owner then reads that thread's pipe and waits for a reply that never comes,
@@ -829,12 +830,40 @@ The 2026-10-10 freezes fit: a thread had vanished holding ntdll's `fd_cache_mute
 ([known issues](known-issues.md#intermittent-freeze-while-a-project-loads)), another
 `dxvk-submit` had died holding the same `surfaces_lock`, and closing its view then hung.
 
-Who closes them is not known yet. Wine's own code does not, apart from the cases above.
-Two of the `wine client error`s and the 2026-10-14 freeze came right after DXVK had
-created a swapchain or a device (`DXGI: MakeWindowAssociation`, `Loaded igd10iumd64.dll`).
-That points at native code that runs then: Mesa's Vulkan driver and X11 WSI, libxcb.
-The present-wait layer (§11) also opens X connections at that point, but the problem
-predates it: it was first written down on 2026-10-09, and the layer came a day later.
+**Who closes them: Wine itself.** The guard below first only refused closes of server
+pipes, which happen rarely. A later version also logs every `close()` that fails with
+`EBADF`: a double close that, this time, hit a number nobody had. In Altium it named two
+call sites within a minute of starting, both in Wine (ValveSoftware/wine, which Proton
+and soda are built from):
+
+- **The thread exit closes an fsync index.** Each thread keeps an `alert_fd` right after
+  its server fds (TEB+0x394 in soda-11.0-7), and `pthread_exit_wrapper()` in
+  `dlls/ntdll/unix/thread.c` closes it. Under ntsync it is a real fd. Under fsync it is
+  not: the thread's first alertable wait asks `get_inproc_alert_fd()` for its APC event
+  (`fsync.c`), which stores the event's shared-memory index in it
+  (`data->alert_fd = fd = reply->fsync_shm_idx;` in `sync.c`). So every thread that ever
+  waited alertably closes, when it ends, whatever fd has the number of its fsync index.
+  .NET thread-pool workers wait alertably and come and go all the time, so in Altium this
+  happens many times a minute. The indices seen (about 2000 to 4800) are in the range of
+  Altium's fd numbers once it runs many threads (in the 2026-10-14 freeze, fd 1882 was a
+  reply pipe), and a busy process hands out low numbers again right away. Mostly the
+  number is free and nothing happens (`EBADF`). When it is not, the close takes another
+  thread's server pipe (the freezes above), or anything else: in one test session the
+  guard caught a thread exit about to close `/dev/dri/renderD128`, the GPU device DXVK
+  draws with. DXVK starts and ends threads when it creates a device or swapchain, which
+  is why the `wine client error`s came right after one.
+- **`crypt32.so` closes a fd twice.** `import_certs_from_file()` `fclose()`s the CA
+  bundle it was given as a fd, and `import_certs_from_path()` then `close()`s that fd
+  again. This happens once per process, when the root certificate store loads.
+
+This bottle uses fsync only by accident: its Bottles setting is `sync: ntsync`, but
+`/dev/ntsync` does not exist (the `ntsync` kernel module is not loaded), and Bottles then
+falls back to `WINEFSYNC=1` (`_apply_sync_environment` in Bottles' `winecommand.py`).
+
+The fsync bug reproduces in a few seconds (`tests/test_fdguard_wine.py`, below): with a
+`/dev/null` "canary" on every free fd number below 32768, 200 threads that each make one
+alertable wait (`SleepEx(1, TRUE)`) and end closed 81 canaries, and the program hung,
+having lost some of its own fds the same way.
 
 **Fix:** [`src/fdguard/fdguard.c`](../src/fdguard/fdguard.c), preloaded into the bottle's
 Wine processes (`LD_PRELOAD`, set by `install.sh`). It remembers, by inode, the pipes
@@ -844,8 +873,20 @@ other code: `close()` returns 0 without closing, `dup2`/`dup3` fail with `EBUSY`
 `close_range` family skip the fd. A double close then does nothing. The caller is told
 apart by its return address, so ntdll's own closes always go through.
 
+It also skips Wine's two bad closes. ntdll.so closing a thread's `alert_fd` is skipped
+unless the fd is an ntsync object (`/proc/self/fd/N` names `ntsync`). The guard finds
+`alert_fd` as the int after the thread's four server fds, which it locates once in the TEB
+as four ints in a row that are pipes ntdll.so made. The first time it sees a thread exit
+(that close, then the thread's own `wait_fd[0]`), it notes the call site, and from then on
+skips only closes from there. A close of the same number from elsewhere in ntdll.so (its
+fd cache) is a real one. `crypt32.so` closing a fd that its own
+`fclose()` has just closed is skipped too. Each skip that would have closed an open fd is
+logged with what that fd was. In log mode (`ALTIUM_FD_GUARD=log`) these closes go through.
+
 Each refusal goes to `<bottle>/altium-on-linux/logs/fd-guard.log` and to stderr (so into
-`debug-launch.sh`'s log), with a backtrace that names the code that tried. ntdll.so
+`debug-launch.sh`'s log), with a backtrace that names the code that tried. So does every
+`close()` that fails with `EBADF`, with a backtrace once per call chain and then a line at
+its 2nd, 4th, 8th... time: that is how the two Wine bugs were found. ntdll.so
 closing a pipe is also logged if the pipe is not the calling thread's own and is more
 than five seconds old. The thread's own pipes are found in its TEB, which the guard gets
 from ntdll's `NtCurrentTeb` and checks (a TEB points at itself at +0x30). That catches a
@@ -864,18 +905,26 @@ What the guard cannot see:
 
 Tests:
 
-- [`tests/test_fdguard.py`](../tests/test_fdguard.py) checks 14 cases on the host, with
-  a stand-in `ntdll.so` whose `NtCurrentTeb` returns fake TEBs: stray closes, Wine's own
-  closes (new pipes, thread exits, another thread's pipe, no TEB, a value that is not a
-  TEB), stale numbers, `dup2`/`dup3`, `close_range`/`closefrom`, the received pipe,
-  forks, and the log and off modes.
+- [`tests/test_fdguard.py`](../tests/test_fdguard.py) checks 19 cases on the host, with
+  a stand-in `ntdll.so` whose `NtCurrentTeb` returns fake TEBs and a stand-in
+  `crypt32.so`: stray closes, Wine's own closes (new pipes, thread exits, another thread's
+  pipe, no TEB, a value that is not a TEB), stale numbers, `dup2`/`dup3`,
+  `close_range`/`closefrom`, the received pipe, forks, the log and off modes, double
+  closes (`EBADF`), and the two skipped Wine closes: a thread exit closing an fsync index
+  that is another open fd, a free number, or an ntsync object (a memfd named so, let
+  through), and `crypt32.so`'s second close while another thread has taken the number.
 - [`tests/test_fdguard_wine.py`](../tests/test_fdguard_wine.py) runs a Windows program in
   the bottle's running session. The program starts and ends 320 threads, and four that
   live 6 s, so that their exits are checked against their TEB; the log shows no complaint
   about Wine's own closes. Then a native library closes every pipe in the process while a
   worker thread talks to wineserver. With the guard, the 24 server-pipe closes are
   refused, the worker makes 241 more calls, and the main thread and 64 new threads work.
-  Without it (`--control`), the program dies.
+  Without it (`--control`), the program dies. The alert test then runs in the session's
+  own sync mode: the canaries above, and 200 threads that make one alertable wait and end
+  (plus 20 that are still waiting when the program exits, which Wine ends from a signal
+  handler).
+  Under fsync, with the guard no canary is closed and the guard logs 200 skipped closes;
+  without it, 81 of them were closed and the program hung.
 
 The first version found the TEB through the GS base and called `process_vm_readv` with
 an `int` for its last argument, which `syscall()` reads as a `long`, so the kernel saw
@@ -883,5 +932,70 @@ garbage flags. Every long-lived thread that exited in Altium was then logged as 
 another thread's pipe. These closes were only logged, never refused. The test above did
 not catch it: all its threads lived under the 5 s grace.
 
-Not done yet: confirming over long Altium sessions that the freezes are gone, and fixing
-whatever the guard's log names as the culprit at its source.
+Loading the `ntsync` module (`sudo modprobe ntsync`, and `ntsync` in
+`/etc/modules-load.d/` to keep it) avoids the fsync path altogether: Bottles then sets
+`WINENTSYNC=1` for this bottle, and `alert_fd` is a real fd. Not tried with Altium yet.
+
+Not done yet: confirming over long Altium sessions that the freezes are gone, and
+reporting both Wine bugs upstream.
+
+## 21. A monitor stuck at 0x0: Altium shows no window, or loses them all
+
+Seen twice on 2026-10-14 with a Dell WD22TB4 dock, whose two monitors come through
+DisplayPort MST. Once `scripts/debug-launch.sh` started Altium and no window ever came
+up: `X2.EXE` sat idle at ~78 MB while `explorer.exe /desktop` used 100% of a core and
+the log grew at ~40 MB/s (10 GB in four minutes). The other time the dock reconnected
+under a running Altium, which lost all its X windows (an empty `_NET_CLIENT_LIST`). It
+looked as if it had crashed, and the log reached 36 GB.
+
+Both times Hyprland had failed to bring a monitor up. After a hotplug the kernel rejected
+every mode on the MST outputs (`atomic drm request: failed to commit: Invalid argument`),
+and Hyprland kept them "connected" at 0x0. XWayland lists such a monitor as a connected
+output whose CRTC has a 0x0 mode (`xrandr --listmonitors` shows `0/0x0/0`, and
+`hyprctl monitors all` shows `0x0@`).
+
+Wine takes that output for an active monitor with a 0x0 mode. Proton's win32u computes
+DPI with integers, `monitor_get_dpi()` in `dlls/win32u/sysparams.c`:
+
+```c
+num = source->physical.dmPelsWidth;
+den = source->current.dmPelsWidth;
+d = gcd( num * dpi, den );       /* gcd(0, 0) = 0 */
+...
+den /= d;                        /* integer divide by zero */
+```
+
+(upstream Wine does the same in floating point and gets infinity instead). The divide
+faults at `win32u.so+0x30823` in soda-11.0-7 (`EXCEPTION_INT_DIVIDE_BY_ZERO`) inside a
+system call, and the process then logs `handle_syscall_fault ... returning to user mode`
+forever. explorer.exe owns the desktop window, so every program in the session is stuck
+with it.
+
+Switching the 0x0 outputs off in Hyprland at runtime
+(`hyprctl eval 'hl.monitor({ output = "DP-4", disabled = true })'`) and restarting the
+session worked, but only after the session was lost.
+
+**Fix:** [`src/xrandrfilter/xrandrfilter.c`](../src/xrandrfilter/xrandrfilter.c),
+preloaded next to the fd guard. winex11.so looks up every XRandR function with `dlsym()`
+on libXrandr's handle, which `LD_PRELOAD` alone does not reach, so the library wraps
+`dlsym()`. For `XRRGetOutputInfo` it returns a wrapper that reports a connected output
+whose CRTC has a 0x0 mode as disconnected. An output that is switched off (no CRTC) is
+left alone, because Wine handles that case. Every other lookup goes on to the next
+`dlsym()` as a tail call, so lookups that depend on the caller (`RTLD_NEXT`) still see
+the original caller. Each hidden output is logged to
+`<bottle>/altium-on-linux/logs/xrandr-filter.log`. When the monitor comes back with a
+real mode, XRandR reports the change, Wine asks again, and the output shows up.
+`ALTIUM_XRANDR_FILTER=off` turns it off.
+
+Tests:
+
+- [`tests/test_xrandrfilter.py`](../tests/test_xrandrfilter.py), on the host: a stand-in
+  libXrandr with a normal output, a 0x0 one, one without a CRTC and a disconnected one,
+  looked up the way winex11.so does. Only the 0x0 output changes, and `RTLD_NEXT`
+  lookups still resolve from the program.
+- [`tests/test_xrandrfilter_wine.py`](../tests/test_xrandrfilter_wine.py) runs
+  `wininfo.exe` in a throwaway prefix of the runner. A test library makes one real output
+  look like XWayland's 0x0 one (`tests/xrandrfilter_zero.c`). With the filter, Wine lists
+  only the other monitor. Without it (`--control`), win32u divides by zero at
+  `+0x30823` and loops in `handle_syscall_fault`, as explorer.exe did, whichever output
+  is zeroed.

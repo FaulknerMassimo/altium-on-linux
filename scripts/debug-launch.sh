@@ -42,10 +42,23 @@ LOG=${LOG:-$STAGE/logs/altium-$(date +%Y%m%d-%H%M%S).log}
 case $LOG in "$HOME"/.var/app/$APP/*) ;; *) die "the log must be inside $HOME/.var/app/$APP (the sandbox cannot write elsewhere)";; esac
 if [ -n "$DOC" ] && [ -e "$DOC" ]; then DOC=$(winpath "$(realpath "$DOC")"); fi
 
+# Same sync mode as Bottles (_apply_sync_environment): ntsync needs /dev/ntsync (the ntsync
+# kernel module), else "ntsync" falls back to fsync.
+sync=$(sed -n 's/^    sync: //p' "$BOTTLE_DIR/bottle.yml")
+case $sync in
+    esync) sync_env=WINEESYNC=1 ;;
+    fsync) sync_env=WINEFSYNC=1 ;;
+    wine|ntsync)
+        if [ -r /dev/ntsync ] && grep -q /dev/ntsync "$RUNNER_DIR/bin/wineserver"; then sync_env=WINENTSYNC=1
+        elif [ "$sync" = ntsync ]; then sync_env=WINEFSYNC=1
+        else sync_env=; fi ;;
+    *) sync_env= ;;
+esac
+
 # Same environment Bottles uses for this bottle (see `ps e` of a Bottles launch).
 env_args=(
     WINEPREFIX="$BOTTLE_DIR" WINEARCH=win64 BOTTLE="$BOTTLE"
-    WINEFSYNC=1 WINE_LARGE_ADDRESS_AWARE=1 STAGING_SHARED_MEMORY=1
+    ${sync_env:+"$sync_env"} WINE_LARGE_ADDRESS_AWARE=1 STAGING_SHARED_MEMORY=1
     WINEDLLOVERRIDES="winemenubuilder=;easyanticheat_x86,easyanticheat_x64=b,n;beclient,beclient_x64=b,n"
     LD_LIBRARY_PATH="$RUNNER_DIR/lib:$RUNNER_DIR/lib/wine/x86_64-unix:$RUNNER_DIR/lib/wine/i386-unix"
     WINEDEBUG="$CHANNELS" DXVK_LOG_LEVEL=info DXVK_LOG_PATH=none
@@ -59,7 +72,7 @@ env_args+=("${EXTRA_ENV[@]}")
 args=("C:\\Program Files\\Altium\\$ALTIUM_DIR\\X2.EXE")
 [ -z "$DOC" ] || args+=("$DOC")
 
-say "Starting Altium ($ALTIUM_DIR) with WINEDEBUG=$CHANNELS"
+say "Starting Altium ($ALTIUM_DIR) with WINEDEBUG=$CHANNELS, ${sync_env:-server-side sync}"
 say "Log: $LOG"
 # shellcheck disable=SC2016 # expanded by the inner bash
 flatpak run --command=bash "$APP" -c 'cd "$1" && shift && exec env "$@"' _ "$AD" \
