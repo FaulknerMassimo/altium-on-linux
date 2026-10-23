@@ -5,7 +5,7 @@
  * X2.EXE is loaded early. Its exports forward to shell32 like Wine's own
  * shfolder. On load it works around six Wine gaps, in X2.EXE and in every DLL
  * loaded later (via LdrRegisterDllNotification), one VCL bug that shows up
- * under Wine (7), and a Wine-on-DXVK slowdown (8):
+ * under Wine (7), a Wine-on-DXVK slowdown (8) and a race in DXVK (9):
  *
  * 1. Missing user32 functions. Altium delay-loads a few newer user32 functions
  *    that Wine does not export (InheritWindowMonitor is still a stub in upstream
@@ -78,6 +78,13 @@
  *    swap back and the next swap in are skipped while nothing else uses the context; the
  *    application's state goes back before any other caller uses the context, and at
  *    EndDraw. ALTIUM_KEEP_D2D_SWAPS=1 turns this off.
+ *
+ * 9. Crash on the first frame of a schematic. DXVK 3.1's memory allocator hands out its
+ *    allocation objects from a free list under a mutex, except when it imports a resource,
+ *    as it does for the images of each new swapchain, on its command thread. If d2d1 creates
+ *    a buffer on the UI thread at that moment, the free list is corrupted and the next
+ *    allocation crashes. Once DXVK's d3d11.dll is loaded, its two import functions are found
+ *    by their code and run with the allocator's mutex held, as upstream DXVK now does.
  *
  * Build: scripts/build.sh (clang + lld-link + llvm-dlltool; no Windows SDK or CRT needed).
  */
@@ -1128,6 +1135,20 @@ static BYTE *code_section(BYTE *base, DWORD *size)
     return 0;
 }
 
+/* Makes code start with a jump to target. */
+static int jump_to(BYTE *code, void *target)
+{
+    BYTE jump[14] = { 0xff, 0x25 }; /* jmp [rip+0]; dq target */
+    DWORD old;
+
+    memcpy(jump + 6, &target, sizeof(target));
+    if (!VirtualProtect(code, sizeof(jump), PAGE_EXECUTE_READWRITE, &old)) return 0;
+    memcpy(code, jump, sizeof(jump));
+    VirtualProtect(code, sizeof(jump), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, sizeof(jump));
+    return 1;
+}
+
 static int is_nested_activation(BYTE *code, BYTE *end)
 {
     return code_matches(code, end - code, nested_activation_code)
@@ -1137,9 +1158,8 @@ static int is_nested_activation(BYTE *code, BYTE *end)
 /* Runs before X2.EXE's own code: SHFolder.dll is one of its imports. */
 static void patch_nested_activation(BYTE *exe)
 {
-    BYTE *text, *end, *code = 0, jump[14] = { 0xff, 0x25 }; /* jmp [rip+0]; dq target */
-    void *target = (void *)nested_activation_hook;
-    DWORD size, old;
+    BYTE *text, *end, *code = 0;
+    DWORD size;
 
     if (!exe || exe[0] != 'M' || exe[1] != 'Z' || !(text = code_section(exe, &size))) return;
     end = text + size;
@@ -1154,12 +1174,8 @@ static void patch_nested_activation(BYTE *exe)
     vcl_is_class = (is_class_fn)rel32_target(code + NA_IS_CLASS);
     vcl_get_handle = (get_handle_fn)rel32_target(code + NA_GET_HANDLE);
     vcl_send_message = (send_message_fn)rel32_target(code + NA_SEND_MESSAGE);
-    memcpy(jump + 6, &target, sizeof(target));
-    if (!VirtualProtect(code, sizeof(jump), PAGE_EXECUTE_READWRITE, &old)) return;
-    memcpy(code, jump, sizeof(jump));
-    VirtualProtect(code, sizeof(jump), old, &old);
-    FlushInstructionCache(GetCurrentProcess(), code, sizeof(jump));
-    OutputDebugStringA("shfolderproxy: VCL DoNestedActivation replaced in X2.EXE\n");
+    if (jump_to(code, (void *)nested_activation_hook))
+        OutputDebugStringA("shfolderproxy: VCL DoNestedActivation replaced in X2.EXE\n");
 }
 
 /* ---- 8. Direct3D state swaps around every Direct2D draw -------------------- */
@@ -1459,6 +1475,128 @@ static HRESULT create_dxgi_rt_hook(void *factory, void *surface, const void *des
     return hr;
 }
 
+/* ---- 9. DXVK's allocator: imported resources without its lock -------------- */
+
+/* DXVK's DxvkMemoryAllocator hands out the objects that describe allocations from a pool (a free
+ * list) under its mutex, except in importImageResource and importBufferResource: DXVK 3.1 takes
+ * from the pool there without the lock (fixed upstream in 0847af33b7, after 3.1.1). The
+ * presenter imports the images of every Vulkan swapchain it creates, on DXVK's command thread,
+ * when a view presents for the first time or after a resize. If the UI thread allocates at
+ * that moment, as Wine's d2d1 does for every shape it draws (a vertex and an index buffer), both
+ * threads can take the same entry, and the free list ends up pointing at an object in use:
+ * Altium crashed in DxvkResourceAllocationPool::alloc, under CreateBuffer, on the first frame of
+ * a schematic. Skipping d2d1's state swaps (8) makes it allocate faster and the collision more
+ * likely; it is not the cause.
+ *
+ * When DXVK's d3d11.dll loads, both functions are found by their code (DXVK 3.1, x64), along with
+ * a lock of the allocator's mutex (an SRW lock, at ALLOCATOR_MUTEX) in its freeAllocation, and
+ * each function starts with a jump to a wrapper that holds that mutex around it, as upstream
+ * does. The instructions the jump replaces are repeated in dxvk_import_*_original, which goes
+ * on after them. Any other build of d3d11.dll is left alone. */
+
+#define ALLOCATOR_MUTEX 0x10 /* DxvkMemoryAllocator::m_mutex, in dxvk_allocator_lock_code */
+
+/* importImageResource(Rc<DxvkResourceAllocation> *ret, DxvkMemoryAllocator *this, createInfo,
+ * allocationInfo, VkImage), up to the pop from the pool (whose head is at +0x4af8) */
+static const char dxvk_import_image_code[] =
+    "56 53 48 83 ec 48 66 0f ef c9 4c 8b 92 f8 4a 00 00 66 48 0f 6e d2 48 89 cb 49 89 d3 66 0f 6c ca "
+    "4d 85 d2 0f 84 87 00 00 00 49 8b 12 66 0f ef c0 49 89 93 f8 4a 00 00";
+#define DXVK_IMPORT_IMAGE_REPLACED 17 /* the bytes dxvk_import_image_original repeats */
+
+/* importBufferResource(ret, this, createInfo, allocationInfo, const DxvkBufferImportInfo &) */
+static const char dxvk_import_buffer_code[] =
+    "41 56 57 56 53 48 83 ec 48 66 0f ef c9 4c 8b 92 f8 4a 00 00 66 48 0f 6e d2 4c 89 cf 48 89 cb "
+    "49 89 d3 4c 8b 8c 24 90 00 00 00 4c 89 c6 66 0f 6c ca 4d 85 d2 0f 84 e3 00 00 00 49 8b 12 66 0f "
+    "ef c0 49 89 93 f8 4a 00 00";
+#define DXVK_IMPORT_BUFFER_REPLACED 20
+
+/* freeAllocation: lea 0x10(%rsi), %rdi; mov %rdi, %rcx; mov %rdi, 0x40(%rsp); call (a jump to
+ * AcquireSRWLockExclusive) */
+static const char dxvk_allocator_lock_code[] = "48 8d 7e 10 48 89 f9 48 89 7c 24 40 e8 ?? ?? ?? ??";
+#define DXVK_LOCK_CALL 13
+
+IMPORT void AcquireSRWLockExclusive(void *lock);
+IMPORT void ReleaseSRWLockExclusive(void *lock);
+
+typedef void *(*dxvk_import_fn)(void *ret, BYTE *allocator, const void *create_info, const void *allocation_info,
+                                const void *what);
+void *dxvk_import_image_original(void *ret, BYTE *allocator, const void *create_info, const void *allocation_info,
+                                 const void *image);
+void *dxvk_import_buffer_original(void *ret, BYTE *allocator, const void *create_info, const void *allocation_info,
+                                  const void *import_info);
+
+/* Read by the stubs: where the original functions go on. */
+void *dxvk_import_image_resume, *dxvk_import_buffer_resume;
+
+__asm__(
+    ".text\n"
+    "dxvk_import_image_original:\n"
+    "    pushq %rsi\n"
+    "    pushq %rbx\n"
+    "    subq $0x48, %rsp\n"
+    "    pxor %xmm1, %xmm1\n"
+    "    movq 0x4af8(%rdx), %r10\n"
+    "    jmpq *dxvk_import_image_resume(%rip)\n"
+    "dxvk_import_buffer_original:\n"
+    "    pushq %r14\n"
+    "    pushq %rdi\n"
+    "    pushq %rsi\n"
+    "    pushq %rbx\n"
+    "    subq $0x48, %rsp\n"
+    "    pxor %xmm1, %xmm1\n"
+    "    movq 0x4af8(%rdx), %r10\n"
+    "    jmpq *dxvk_import_buffer_resume(%rip)\n");
+
+static void *locked_import(dxvk_import_fn original, void *ret, BYTE *allocator, const void *create_info,
+                           const void *allocation_info, const void *what)
+{
+    AcquireSRWLockExclusive(allocator + ALLOCATOR_MUTEX);
+    ret = original(ret, allocator, create_info, allocation_info, what);
+    ReleaseSRWLockExclusive(allocator + ALLOCATOR_MUTEX);
+    return ret;
+}
+
+static void *import_image_hook(void *ret, BYTE *allocator, const void *create_info, const void *allocation_info,
+                               const void *image)
+{
+    return locked_import(dxvk_import_image_original, ret, allocator, create_info, allocation_info, image);
+}
+
+static void *import_buffer_hook(void *ret, BYTE *allocator, const void *create_info, const void *allocation_info,
+                                const void *import_info)
+{
+    return locked_import(dxvk_import_buffer_original, ret, allocator, create_info, allocation_info, import_info);
+}
+
+/* True if the call at code + DXVK_LOCK_CALL goes through a jump to AcquireSRWLockExclusive. */
+static int calls_acquire_srw_lock(BYTE *code)
+{
+    BYTE *thunk = rel32_target(code + DXVK_LOCK_CALL);
+    return thunk[0] == 0xff && thunk[1] == 0x25
+            && *(void **)rel32_target(thunk + 2) == (void *)AcquireSRWLockExclusive;
+}
+
+/* From the load notification: nothing can have called into d3d11.dll yet. */
+static void patch_dxvk_allocator(BYTE *base)
+{
+    BYTE *text, *end, *image = 0, *buffer = 0, *lock = 0;
+    DWORD size;
+
+    if (is_wine_builtin(base) || !(text = code_section(base, &size))) return;
+    end = text + size;
+    for (BYTE *p = text; p < end; p++) {
+        if (!image && *p == 0x56 && code_matches(p, end - p, dxvk_import_image_code)) image = p;
+        else if (!buffer && *p == 0x41 && code_matches(p, end - p, dxvk_import_buffer_code)) buffer = p;
+        else if (!lock && *p == 0x48 && code_matches(p, end - p, dxvk_allocator_lock_code) && calls_acquire_srw_lock(p))
+            lock = p;
+    }
+    if (!image || !buffer || !lock) return;
+    dxvk_import_image_resume = image + DXVK_IMPORT_IMAGE_REPLACED;
+    dxvk_import_buffer_resume = buffer + DXVK_IMPORT_BUFFER_REPLACED;
+    if (jump_to(image, (void *)import_image_hook) && jump_to(buffer, (void *)import_buffer_hook))
+        OutputDebugStringA("shfolderproxy: DXVK allocator imports locked in d3d11.dll\n");
+}
+
 /* ---- Hooks in Wine's d2d1.dll (6 and 8) ------------------------------------ */
 
 /* On its own thread, like patch_dwrite: d2d1 cannot be used from the load notification. The
@@ -1587,6 +1725,8 @@ static void dll_loaded(DWORD reason, const DLL_NOTIFICATION_DATA *data, void *co
         dwrite_loaded(data->dll_base);
     else if (wname_is(data->base_name->buffer, data->base_name->length / 2, "d2d1.dll"))
         d2d1_loaded(data->dll_base);
+    else if (wname_is(data->base_name->buffer, data->base_name->length / 2, "d3d11.dll"))
+        patch_dxvk_allocator(data->dll_base);
 }
 
 BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
@@ -1602,6 +1742,7 @@ BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
         LdrRegisterDllNotification(0, (void *)dll_loaded, 0, &cookie);
         if (GetModuleHandleW(L"dwrite.dll")) dwrite_loaded(GetModuleHandleW(L"dwrite.dll"));
         if (GetModuleHandleW(L"d2d1.dll")) d2d1_loaded(GetModuleHandleW(L"d2d1.dll"));
+        if (GetModuleHandleW(L"d3d11.dll")) patch_dxvk_allocator(GetModuleHandleW(L"d3d11.dll"));
     }
     return 1;
 }

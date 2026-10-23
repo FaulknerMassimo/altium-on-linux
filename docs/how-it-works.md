@@ -32,6 +32,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 20 | Altium freezes now and then: no redraws, no input, the UI thread idle | under fsync, every Wine thread that ends closes the fd whose number is its fsync index (Wine's `alert_fd`), whatever that fd is: another thread's pipe to wineserver (that thread then waits forever, often holding a lock), the GPU device...; `crypt32` closes one fd twice | fd guard (`LD_PRELOAD`) skips those closes, refuses closes of Wine's server pipes from other code, and logs both |
 | 21 | A monitor stuck at 0x0 (a dock reconnecting): Altium starts with no window, or a running one loses all its windows; `explorer.exe` at 100% CPU, the log growing tens of MB/s | XWayland lists the monitor as connected with a 0x0 mode, and Proton's win32u divides by its width | XRandR filter (`LD_PRELOAD`) hides outputs whose CRTC is 0x0 from Wine |
 | 22 | Popups close as soon as the cursor leaves them (the PCB editor's list for picking one of several objects) | Omarchy's `input:follow_mouse = 1` focuses the main window under the cursor, and the popup closes when it loses focus | `no_follow_mouse` for `steam_app_altium` |
+| 23 | Altium crashes when a schematic is first drawn (`System.AccessViolationException`, now and then) | DXVK 3.1 imports each new swapchain's images on its command thread without its allocator's lock, while d2d1 creates buffers on the UI thread: the allocator's free list is corrupted | `SHFolder.dll` proxy runs DXVK's two import functions with the lock held, as DXVK now does upstream |
 
 ## 1. ICU error in the installer
 
@@ -719,8 +720,7 @@ again, and d2d1's own code.
 
 One session out of 17 with this hook crashed on its first schematic frame, in DXVK's
 memory allocator under `ID3D11Device::CreateBuffer` called from d2d1 (a corrupted free
-list). It did not happen again in 16 sessions; the cause is not known. See
-[known-issues.md](known-issues.md#smaller-things).
+list). That is a race in DXVK, which the hook only makes more likely: see §23.
 
 ## 19. Altium drawn offset after a monitor goes away and comes back
 
@@ -1037,3 +1037,45 @@ popups the same way, and Omarchy turns off focus follows mouse for them.
 ([`config/hyprland/altium.lua`](../config/hyprland/altium.lua)). Altium's windows then take
 focus only when clicked, as on Windows; other windows still follow the mouse. It is a
 dynamic rule, so it applies to a running Altium as soon as Hyprland reloads its config.
+
+## 23. Crash when a schematic is first drawn (a race in DXVK's allocator)
+
+Now and then Altium closed without a word as a schematic opened, about half a second after
+the schematic view loaded. Wine's log showed `System.AccessViolationException` from
+`Altium.Sch.Painter.BasePainter.PresentToWnd` through `GeometryMaker` into Wine's d2d1 and
+DXVK's `d3d11.dll`, the same five DXVK frames each time (`+0xF0FF7`, `+0xF9E08`, `+0xFA1E0`,
+`+0x688A0`, `+0xAC7CE` in DXVK 3.1). It happened once while §18 was being measured, and again
+on 2026-10-23, an hour and a half into a session, on opening a schematic.
+
+DXVK has no symbols, so the frames were matched with its source: `+0xFA1E0` holds the
+allocator's "Got allocation from memory type ... without global buffer" message, and the
+fault at `+0xF0FF7` reads the head of a free list at offset `0x4af8` of the
+`DxvkMemoryAllocator`: `DxvkResourceAllocationPool::alloc`, which hands out the objects that
+describe allocations. The head pointed at garbage. Every function that takes from or gives
+back to that list holds the allocator's mutex (an SRW lock at offset `0x10`, taken in
+`freeAllocation`) except two: `importImageResource` and `importBufferResource` take from it
+with no lock. The presenter imports the images of every Vulkan swapchain it creates, on
+DXVK's command thread, when a window presents for the first time or after its size changes.
+A new schematic view does exactly that while the UI thread creates a vertex and an index
+buffer for every shape d2d1 draws. When both threads pop the same entry, two allocations
+share one object, and the list is corrupted. Skipping d2d1's state swaps (§18) doubles the
+rate of buffer creation, so the crash is more likely with it, but it is not the cause.
+Upstream DXVK fixed it on 2026-10-16 (commit `0847af33b7`, "Lock allocator when creating
+imported and sparse allocations"), after 3.1.1, the latest release.
+
+[`tests/test_dxvk_alloc_wine.py`](../tests/test_dxvk_alloc_wine.py) reproduces it in a
+throwaway prefix with the bottle's DXVK: a hidden window is resized and presented in a loop
+(about 50 new swapchains a second) while two threads create and release buffers. Without the
+fix, four runs out of four crashed (the first after 1 s and 28 swapchains): in `+0xF0FF7`
+with the same frames as in Altium, in the import itself (`+0xF0E69`), and elsewhere in the
+allocator. With it, 60 s, 2,936 swapchains and 6.8 million buffers went through.
+
+**Fix:** in the `SHFolder.dll` proxy (item 9). When DXVK's `d3d11.dll` loads, the proxy finds
+the two import functions by their code, and the lock of the allocator's mutex at offset `0x10`
+in `freeAllocation` (a call to `AcquireSRWLockExclusive` through the import table). It points
+each function at a wrapper that holds that mutex while the original runs, which is what
+upstream added. The instructions that the jump overwrites are repeated in a stub, which then
+continues in DXVK's code. No branch in either function leads back into them. Each function has
+exactly one caller (the constructors of imported images and buffers). Any other build of
+`d3d11.dll`, including a DXVK release with the fix, does not match and is left alone.
+

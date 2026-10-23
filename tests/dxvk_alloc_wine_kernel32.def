@@ -1,0 +1,13 @@
+LIBRARY kernel32.dll
+EXPORTS
+GetStdHandle
+WriteFile
+ExitProcess
+LoadLibraryW
+GetProcAddress
+GetEnvironmentVariableW
+CreateThread
+WaitForSingleObject
+GetTickCount
+GetModuleHandleW
+Sleep

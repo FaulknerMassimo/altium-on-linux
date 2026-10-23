@@ -70,6 +70,7 @@ Hyprland rules only matter on Hyprland.
 | 20 | Altium freezes now and then: no redraws, no input (`wine client error … Bad file descriptor` earlier in the log) | fd guard (`LD_PRELOAD`) skips Wine's own closes of fds it does not own (under fsync, each ending thread closes a random fd), keeps other code off the pipes Wine's threads use to talk to wineserver, and logs both |
 | 21 | A monitor stuck at 0x0 (dock reconnecting): Altium starts with no window or loses all its windows, `explorer.exe` at 100% CPU | XRandR filter (`LD_PRELOAD`) hides outputs whose CRTC is 0x0 from Wine |
 | 22 | Popups close as soon as the cursor leaves them, such as the PCB editor's list for picking one of several objects (Hyprland, focus follows mouse) | `no_follow_mouse` for `steam_app_altium` |
+| 23 | Altium crashes now and then when a schematic is first drawn (`System.AccessViolationException`) | `SHFolder.dll` proxy holds DXVK's allocator lock while DXVK imports a new swapchain's images (a race fixed upstream after DXVK 3.1.1) |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.
@@ -175,7 +176,7 @@ and you can use your license.
 | Where | What | Fix |
 |---|---|---|
 | `Program Files\Altium\AD26\cmd.exe` | shim: opens `cmd /c start <url>` links directly, passes everything else to the real `cmd.exe` | 6 |
-| `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text, layered windows, Direct2D arcs, stale panel focus | 9, 10, 12, 13, 14, 15, 16 |
+| `Program Files\Altium\AD26\SHFolder.dll` | proxy: forwards to `shell32`, supplies missing `user32` functions, raw RSA for Simbeor, schematic text, layered windows, Direct2D arcs, stale panel focus, Direct3D state swaps, DXVK allocator lock | 9, 10, 12, 13, 14, 15, 16, 18, 23 |
 | `Program Files\Altium\AD26\dxvk.conf` | `dxgi.syncInterval = 0` | 11 |
 | `<bottle>/altium-on-linux/vulkan/` | Vulkan layer (Linux library and manifest) that waits for each present | 11 |
 | `<bottle>/altium-on-linux/fdguard/` | fd guard and XRandR filter (Linux libraries, preloaded into the bottle's Wine processes); log to `<bottle>/altium-on-linux/logs/fd-guard.log` and `xrandr-filter.log` | 20, 21 |
@@ -221,6 +222,7 @@ harmless to keep.
 | `tests/test_xrandrfilter.py` | checks the XRandR filter on the host, with a stand-in libXrandr |
 | `tests/test_xrandrfilter_wine.py` | reproduces Wine's divide by zero on a 0x0 monitor in a throwaway prefix, and checks the filter |
 | `tests/test_layered_wine.py` | checks the image the `SHFolder.dll` proxy hands to Wine for layered windows, from top-down and bottom-up bitmaps, in a throwaway prefix |
+| `tests/test_dxvk_alloc_wine.py` | reproduces DXVK's allocator race (swapchains recreated while threads create buffers) with the bottle's DXVK in a throwaway prefix, and checks the proxy's lock |
 
 ## Repository layout
 
@@ -231,7 +233,8 @@ fonts/           rename_to_segoeui.py (Selawik -> "Segoe UI")
 registry/        .reg files imported by install.sh
 scripts/         build, install, debugging tools (lib.sh is shared)
 src/cmdshim/     cmd.exe shim
-src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA, Direct2D text, layered windows, Direct2D arcs, VCL focus)
+src/shfolderproxy/  SHFolder.dll proxy (user32 fallbacks, raw RSA, Direct2D text, layered windows, Direct2D arcs, VCL focus,
+                    Direct3D state swaps, DXVK allocator lock)
 src/presentwait/ Vulkan layer that waits for each present (Linux)
 src/fdguard/     LD_PRELOAD library that protects Wine's server pipes (Linux)
 src/xrandrfilter/  LD_PRELOAD library that hides 0x0 monitors from Wine (Linux)
