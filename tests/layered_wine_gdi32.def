@@ -1,0 +1,11 @@
+LIBRARY gdi32.dll
+EXPORTS
+CreateDIBSection
+CreateCompatibleDC
+SelectObject
+DeleteDC
+DeleteObject
+GetCurrentObject
+GetObjectW
+GetDIBits
+GdiFlush

@@ -11,7 +11,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | # | Symptom | Cause | Fix |
 |---|---|---|---|
 | 1 | Installer: `Cannot get symbol u_charsToUChars from libicuuc Error: 127` | Wine's `icu.dll` forwards to a missing `icuuc68.dll` | `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1` |
-| 2 | Dialogs hidden behind windows, ghost copies, frozen orange box | Hyprland tiles every X11 window, including Delphi dialogs | float rule on `steam_app_altium` (`SteamAppId=altium`) |
+| 2 | Dialogs hidden behind windows, ghost copies, frozen orange box | Hyprland tiles every X11 window, including Delphi dialogs | float rule on `steam_app_altium` (`SteamAppId=altium`), except the main window |
 | 3 | Offline installer can't find its packages | Bottles' file picker exposes only the `.exe` (document portal) | Flatpak access to the setup folder |
 | 4 | Freeze, black or corner-only windows, ~55 MB/s leak | Proton's `tabtip.exe` UI Automation loop | disable `tabtip.exe` |
 | 5 | Embedded sign-in box stays blank | WebView2 sign-in under Wine | browser sign-in (`System.UnifiedLogin`) |
@@ -31,6 +31,7 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 19 | After a monitor goes away and comes back: Altium drawn offset and cropped, dialogs off-screen | Proton keeps each output's first recorded mode (emulated mode changes) and cannot repoint its per-slot registry links, so a reconnected monitor gets a stale size, a lost slot or a second primary | `EmulateModeset=N`; Hyprland hook runs `refresh-displays.sh`, which deletes the slot links so Wine rebuilds them |
 | 20 | Altium freezes now and then: no redraws, no input, the UI thread idle | under fsync, every Wine thread that ends closes the fd whose number is its fsync index (Wine's `alert_fd`), whatever that fd is: another thread's pipe to wineserver (that thread then waits forever, often holding a lock), the GPU device...; `crypt32` closes one fd twice | fd guard (`LD_PRELOAD`) skips those closes, refuses closes of Wine's server pipes from other code, and logs both |
 | 21 | A monitor stuck at 0x0 (a dock reconnecting): Altium starts with no window, or a running one loses all its windows; `explorer.exe` at 100% CPU, the log growing tens of MB/s | XWayland lists the monitor as connected with a 0x0 mode, and Proton's win32u divides by its width | XRandR filter (`LD_PRELOAD`) hides outputs whose CRTC is 0x0 from Wine |
+| 22 | Popups close as soon as the cursor leaves them (the PCB editor's list for picking one of several objects) | Omarchy's `input:follow_mouse = 1` focuses the main window under the cursor, and the popup closes when it loses focus | `no_follow_mouse` for `steam_app_altium` |
 
 ## 1. ICU error in the installer
 
@@ -55,10 +56,15 @@ Hyprland tiles every X11 window. Delphi apps create an invisible application win
 owned dialogs; tiled, the dialogs end up behind the main window (the "orange box" that
 cannot be moved), and moving things around produces duplicate frames.
 
-**Fix:** float all of Altium's windows. To match them, the bottle sets
+**Fix:** float all of Altium's windows but the main one. To match them, the bottle sets
 `SteamAppId=altium`: Proton's `winex11` then names the windows
 `steam_app_altium`. Setting `SteamGameId` instead did not change the class. Without
-either, every Proton app shares the class `steam_proton`. See
+either, every Proton app shares the class `steam_proton`. The main window is told apart
+by its title, which has the version in brackets (`<project> - Altium Designer
+Professional (26.11.1)`, `Altium Designer (26.10.1) - No License`); the rule floats
+windows whose title does not match, so the main window tiles and the dialogs, floating,
+stay above it. Window rules match the title a window has when it maps, and Altium's main
+window already has its full title then. See
 [`config/hyprland/altium.lua`](../config/hyprland/altium.lua).
 
 Bottles' "Virtual desktop" option is an alternative, but it was not applied to "Run
@@ -404,6 +410,21 @@ of other processes (WebView2) are not covered.
 With the fix the four shadow windows had a one-rectangle shape, and of the splash's
 70,156 fully transparent pixels all but 230 matched the screen behind it within 3%;
 before, 28,980 of them were pure black.
+
+The copy is made with `BitBlt` into a top-down DIB section, which keeps the alpha bytes,
+and the alpha 0 pixels are replaced there. The first version read the source's bits
+itself and took the row order from `GetObject`, but `GetObject` reports the height of
+every DIB section as positive (`DIB_GetObject` in `dlls/win32u/dib.c` takes `abs()`, as
+Windows does), so it read every source as bottom-up. The splash is drawn from bottom-up
+bitmaps and came out right; layered windows drawn from top-down ones came out upside
+down: the progress boxes with rounded corners ("Validation", "Prepare") shown while a
+component is opened or saved to the server.
+[`tests/test_layered_wine.py`](../tests/test_layered_wine.py) checks what reaches Wine:
+it runs a small program in a throwaway prefix that puts itself between `user32` and
+`win32u` before loading the proxy, then calls `UpdateLayeredWindow` from top-down and
+bottom-up DIB sections, whole and in part, with and without pixels of alpha 0. The first
+version failed the three top-down cases (rows reversed, and a copy made for an alpha 0
+pixel outside the area passed).
 
 ## 14. Heads-up display frozen in the PCB view (layered child windows)
 
@@ -999,3 +1020,20 @@ Tests:
   only the other monitor. Without it (`--control`), win32u divides by zero at
   `+0x30823` and loops in `handle_syscall_fault`, as explorer.exe did, whichever output
   is zeroed.
+
+## 22. Popups close as soon as the cursor leaves them (Hyprland focus follows mouse)
+
+Double-clicking where several PCB objects overlap opens a list to pick one of them
+(`TAmbiguityMenuForm`). It closed as soon as the cursor went a little past its edge, so it
+had to be used with slow, careful moves.
+
+Omarchy sets `input:follow_mouse = 1`: Hyprland focuses whichever window the cursor moves
+onto. The list floats over the main window, so leaving it focuses the main window, Wine
+deactivates the list, and Altium closes it, as it does on Windows when you click
+elsewhere. On Windows, moving the cursor never changes focus. JetBrains IDEs close their
+popups the same way, and Omarchy turns off focus follows mouse for them.
+
+**Fix:** a per-window `no_follow_mouse = true` for `steam_app_altium`
+([`config/hyprland/altium.lua`](../config/hyprland/altium.lua)). Altium's windows then take
+focus only when clicked, as on Windows; other windows still follow the mouse. It is a
+dynamic rule, so it applies to a running Altium as soon as Hyprland reloads its config.

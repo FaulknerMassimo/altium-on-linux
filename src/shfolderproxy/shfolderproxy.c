@@ -505,12 +505,14 @@ IMPORT HGDIOBJ SelectObject(HDC hdc, HGDIOBJ obj);
 IMPORT BOOL DeleteDC(HDC hdc);
 IMPORT BOOL DeleteObject(HGDIOBJ obj);
 IMPORT BOOL GdiFlush(void);
+IMPORT BOOL BitBlt(HDC dst, int x, int y, int cx, int cy, HDC src, int sx, int sy, DWORD rop);
 
 #define ULW_ALPHA 2
 #define AC_SRC_ALPHA 1
 #define OBJ_BITMAP 7
 #define BI_RGB 0
 #define DIB_RGB_COLORS 0
+#define SRCCOPY 0x00cc0020
 
 /* win32u's NtUserUpdateLayeredWindow: UpdateLayeredWindow plus a dirty rectangle */
 typedef BOOL (*update_layered_fn)(HWND hwnd, HDC dst, const POINT *dst_pos, const SIZE *size, HDC src,
@@ -519,46 +521,53 @@ typedef BOOL (*update_layered_fn)(HWND hwnd, HDC dst, const POINT *dst_pos, cons
 
 static update_layered_fn real_update_layered;
 
-/* Row y (from the top) of a 32-bit DIB section. */
-static const DWORD *dib_row(const DIBSECTION *dib, int y)
-{
-    if (dib->header.height > 0) y = dib->header.height - 1 - y; /* bottom-up */
-    return (const DWORD *)(dib->bits + (SIZE_T)y * dib->width_bytes);
-}
-
 /* For per-pixel alpha from a 32-bit DIB section, where alpha 0 means invisible: a top-down copy
  * of the source area with alpha 1 (and no colour) in place of alpha 0. 0 if there is none to
- * replace, or for any other source. */
+ * replace, or for any other source. The copy is made with BitBlt, which keeps the alpha bytes
+ * between 32-bit DIBs: GetObject reports the height of every DIB section as positive (Wine's
+ * DIB_GetObject, like Windows), so the source's bits do not tell which row is the top; reading
+ * them as bottom-up turned windows drawn from top-down bitmaps upside down. */
 static HGDIOBJ copy_without_transparent_pixels(HDC src, const POINT *src_pos, const SIZE *size,
                                                const BLENDFUNCTION *blend, DWORD flags)
 {
     BITMAPINFOHEADER header = { .size = sizeof(header), .planes = 1, .bit_count = 32, .compression = BI_RGB };
-    int x, y, sx = src_pos ? src_pos->x : 0, sy = src_pos ? src_pos->y : 0, height, transparent = 0;
+    int sx = src_pos ? src_pos->x : 0, sy = src_pos ? src_pos->y : 0, copied, transparent = 0;
+    SIZE_T i, count;
     DIBSECTION dib;
-    HGDIOBJ copy;
+    HGDIOBJ copy, old;
     DWORD *bits;
+    HDC hdc;
 
     if (!src || !size || !blend || !(flags & ULW_ALPHA) || !(blend->format & AC_SRC_ALPHA)
             || GetObjectW(GetCurrentObject(src, OBJ_BITMAP), sizeof(dib), &dib) != sizeof(dib)
             || !dib.bits || dib.header.bit_count != 32 || dib.header.compression != BI_RGB)
         return 0;
-    height = dib.header.height < 0 ? -dib.header.height : dib.header.height;
     if (sx < 0 || sy < 0 || size->cx <= 0 || size->cy <= 0
-            || size->cx > dib.header.width - sx || size->cy > height - sy)
+            || size->cx > dib.header.width - sx || size->cy > dib.header.height - sy)
         return 0;
 
-    GdiFlush();
-    for (y = 0; y < size->cy && !transparent; y++) {
-        const DWORD *row = dib_row(&dib, sy + y) + sx;
-        for (x = 0; x < size->cx && !transparent; x++) transparent = !(row[x] >> 24);
-    }
     header.width = size->cx;
     header.height = -size->cy;
-    if (!transparent || !(copy = CreateDIBSection(0, &header, DIB_RGB_COLORS, (void **)&bits, 0, 0))) return 0;
+    if (!(copy = CreateDIBSection(0, &header, DIB_RGB_COLORS, (void **)&bits, 0, 0))) return 0;
+    if (!(hdc = CreateCompatibleDC(src))) {
+        DeleteObject(copy);
+        return 0;
+    }
+    old = SelectObject(hdc, copy);
+    copied = BitBlt(hdc, 0, 0, size->cx, size->cy, src, sx, sy, SRCCOPY);
+    SelectObject(hdc, old);
+    DeleteDC(hdc);
+    GdiFlush();
 
-    for (y = 0; y < size->cy; y++) {
-        const DWORD *row = dib_row(&dib, sy + y) + sx;
-        for (x = 0; x < size->cx; x++) *bits++ = row[x] >> 24 ? row[x] : 0x01000000;
+    count = (SIZE_T)size->cx * size->cy;
+    for (i = 0; copied && i < count; i++) {
+        if (bits[i] >> 24) continue;
+        bits[i] = 0x01000000;
+        transparent = 1;
+    }
+    if (!transparent) {
+        DeleteObject(copy);
+        return 0;
     }
     return copy;
 }
@@ -614,7 +623,6 @@ static int user32_ready(void)
     return ready = ok;
 }
 
-IMPORT BOOL BitBlt(HDC dst, int x, int y, int cx, int cy, HDC src, int sx, int sy, DWORD rop);
 IMPORT BOOL PatBlt(HDC hdc, int x, int y, int cx, int cy, DWORD rop);
 IMPORT BOOL GdiAlphaBlend(HDC dst, int x, int y, int cx, int cy, HDC src, int sx, int sy, int scx, int scy,
                           BLENDFUNCTION blend);
@@ -641,7 +649,6 @@ IMPORT BOOL GdiTransparentBlt(HDC dst, int x, int y, int cx, int cy, HDC src, in
 #define WM_ERASEBKGND 0x14
 #define WM_WINDOWPOSCHANGED 0x47
 #define WM_NCDESTROY 0x82
-#define SRCCOPY 0x00cc0020
 #define BLACKNESS 0x00000042
 #define ERROR_INVALID_PARAMETER 87
 #define ERROR_INCORRECT_SIZE 1462

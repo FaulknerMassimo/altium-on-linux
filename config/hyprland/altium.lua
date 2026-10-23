@@ -3,10 +3,17 @@
 --
 -- With SteamAppId=altium in the bottle's environment, Proton's winex11 gives every
 -- Altium window the class steam_app_altium (SteamGameId does not work).
--- * float: tiling hides Delphi dialogs behind the main window and spawns ghost frames.
 -- * focus_on_activate = false: Wine sends activate requests constantly; honouring them
 --   warps the cursor to the window centre (Omarchy applies the same fix to Telegram).
-o.window("^steam_app_altium$", { float = true, focus_on_activate = false })
+-- * no_follow_mouse: with input:follow_mouse = 1, the cursor leaving a popup for the main
+--   window focuses the main window, and Altium closes the popup (the PCB editor's list for
+--   picking one of several objects under the cursor). Click to focus, as on Windows
+--   (Omarchy applies the same fix to JetBrains IDEs).
+o.window("^steam_app_altium$", { focus_on_activate = false, no_follow_mouse = true })
+-- * float everything but the main window, whose title has the version in brackets
+--   ("<project> - Altium Designer Professional (26.11.1)"): tiled, Delphi dialogs end up
+--   behind the main window and spawn ghost frames; floating, they stay above it.
+o.window({ class = "^steam_app_altium$", title = "negative:.*Altium Designer.*\\(\\d+\\.\\d+.*" }, { float = true })
 
 -- Multiple monitors: make the external monitor X11's primary output. Wine puts the X11
 -- primary at Windows (0,0); Altium centres its splash and dialogs on it and restores saved

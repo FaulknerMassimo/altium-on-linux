@@ -49,7 +49,7 @@ Hyprland rules only matter on Hyprland.
 | # | Without the fix | Fix |
 |---|---|---|
 | 1 | Installer: `Cannot get symbol u_charsToUChars from libicuuc Error: 127` | `DOTNET_SYSTEM_GLOBALIZATION_USENLS=1` |
-| 2 | Dialogs hidden behind the main window, ghost copies (Hyprland) | float rule for `steam_app_altium` |
+| 2 | Dialogs hidden behind the main window, ghost copies (Hyprland) | float rule for Altium's windows (`steam_app_altium`) except the main window, which tiles |
 | 3 | Offline installer finds no packages | Flatpak access to the setup folder |
 | 4 | Freezes with black windows and a ~55 MB/s memory leak | disable Proton's `tabtip.exe` |
 | 5 | Sign-in box stays blank | browser sign-in (`System.UnifiedLogin`) |
@@ -69,6 +69,7 @@ Hyprland rules only matter on Hyprland.
 | 19 | After a monitor goes away and comes back (closed lid, monitor off): Altium drawn offset, dialogs off-screen, a monitor lost | registry: `EmulateModeset=N`; Hyprland hook resyncs Wine's monitor list (`scripts/refresh-displays.sh`) |
 | 20 | Altium freezes now and then: no redraws, no input (`wine client error … Bad file descriptor` earlier in the log) | fd guard (`LD_PRELOAD`) skips Wine's own closes of fds it does not own (under fsync, each ending thread closes a random fd), keeps other code off the pipes Wine's threads use to talk to wineserver, and logs both |
 | 21 | A monitor stuck at 0x0 (dock reconnecting): Altium starts with no window or loses all its windows, `explorer.exe` at 100% CPU | XRandR filter (`LD_PRELOAD`) hides outputs whose CRTC is 0x0 from Wine |
+| 22 | Popups close as soon as the cursor leaves them, such as the PCB editor's list for picking one of several objects (Hyprland, focus follows mouse) | `no_follow_mouse` for `steam_app_altium` |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.
@@ -105,17 +106,20 @@ flatpak run --command=bottles-cli com.usebottles.bottles edit -b Altium --env-va
 ### 3. Hyprland only: window rules
 
 Add [`config/hyprland/altium.lua`](config/hyprland/altium.lua) to
-`~/.config/hypr/hyprland.lua`. It floats Altium's windows (tiling hides dialogs behind
-the main window), stops Wine's activate requests from warping the cursor, and with an
-external monitor connected makes it X11's primary output, so Altium opens its windows there
+`~/.config/hypr/hyprland.lua`. It tiles Altium's main window and floats the others
+(tiled, dialogs hide behind the main window), stops Wine's activate requests from warping
+the cursor, turns off focus follows mouse for Altium (it closes popups that lose focus), and
+with an external monitor connected makes it X11's primary output, so Altium opens its windows there
 ([§17](docs/how-it-works.md#17-windows-split-across-monitors-hyprland-mixed-scaling)). Whenever
 a monitor is added, removed or resized, it runs `scripts/refresh-displays.sh` to resync
 Wine's monitor list
 ([§19](docs/how-it-works.md#19-altium-drawn-offset-after-a-monitor-goes-away-and-comes-back));
 set `altium_on_linux` in it to where you cloned this repository. On older
-Hyprland versions with `hyprland.conf`, write the same two rules in your version's
-`windowrule` syntax: `float` and `focus_on_activate off`, matched on class
-`steam_app_altium`, and add `exec-once = xrandr --output <external monitor> --primary`.
+Hyprland versions with `hyprland.conf`, write the same rules in your version's
+`windowrule` syntax: `focus_on_activate off` and `no_follow_mouse` matched on class
+`steam_app_altium`, `float` matched on that class and a title *not* matching
+`.*Altium Designer.*\(\d+\.\d+.*` (the main window), and add
+`exec-once = xrandr --output <external monitor> --primary`.
 
 ### 4. Install Altium
 
@@ -216,6 +220,7 @@ harmless to keep.
 | `tests/test_fdguard_wine.py` | checks the fd guard in a Wine process of the running bottle, and reproduces Wine's fsync close bug |
 | `tests/test_xrandrfilter.py` | checks the XRandR filter on the host, with a stand-in libXrandr |
 | `tests/test_xrandrfilter_wine.py` | reproduces Wine's divide by zero on a 0x0 monitor in a throwaway prefix, and checks the filter |
+| `tests/test_layered_wine.py` | checks the image the `SHFolder.dll` proxy hands to Wine for layered windows, from top-down and bottom-up bitmaps, in a throwaway prefix |
 
 ## Repository layout
 
