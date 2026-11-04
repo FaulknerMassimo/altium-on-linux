@@ -4,9 +4,9 @@ Every problem below was hit on a fresh install and traced to a root cause before
 fixed. Each section gives the symptom, the cause, the evidence and the fix. The
 techniques used are in [debugging.md](debugging.md).
 
-Tested on Altium Designer 26.10.1 (offline installer), Bottles 67.0 (Flatpak), runner
-soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0.56
-(Omarchy) on XWayland, Intel Arc graphics (Mesa 26.1).
+Tested on Altium Designer 26.10.1 (offline installer) and 26.11.1 (online installer),
+Bottles 67.0 (Flatpak), runner soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1,
+vkd3d-proton 3.0.1, Hyprland 0.56 (Omarchy) on XWayland, Intel Arc graphics (Mesa 26.1).
 
 | # | Symptom | Cause | Fix |
 |---|---|---|---|
@@ -35,6 +35,9 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 23 | Altium crashes when a schematic is first drawn (`System.AccessViolationException`, now and then) | DXVK 3.1 imports each new swapchain's images on its command thread without its allocator's lock, while d2d1 creates buffers on the UI thread: the allocator's free list is corrupted | `SHFolder.dll` proxy runs DXVK's two import functions with the lock held, as DXVK now does upstream |
 | 24 | Unplugging the monitor Altium is on (a dock): Altium disappears | Wine keeps window positions when the origin of its coordinates moves (the primary monitor goes away), and unmaps a window left on no monitor; no `WM_DISPLAYCHANGE` arrives | `SHFolder.dll` proxy moves Altium's windows that lie on no monitor onto the nearest one; `onscreen.exe` (run by `refresh-displays.sh`) does it for every program |
 | 25 | `explorer.exe`, then Altium, exit after a monitor goes away (a dock unplugged during a suspend) | an X error Wine does not expect ends the process: `BadRROutput` for an output XWayland just removed, `BadWindow` for a window that died with explorer | XRandR filter (`LD_PRELOAD`) drops RandR errors for resources that are gone and `BadWindow` from mapping, unmapping, destroying or reparenting, and logs them |
+| 26 | Online installer: Sign In opens no browser, "Time to login has expired" | the installer's 32-bit `Authorizer.exe` runs from a new temporary folder, so the `cmd.exe` shim of §6 never reaches it; Wine's `start.exe` crashes on the URL | `start.exe` shim in `syswow64` |
+| 27 | Orange box over the installer's dialogs (Hyprland) | a translucent glow window behind each dialog; Hyprland ignores `_NET_WM_WINDOW_OPACITY` and stacks it on top | Hyprland hook sends the glow to the back |
+| 28 | Empty white 800x800 box next to the installer (Hyprland) | the installer's 0x0 `TApplication` window; Hyprland resizes managed X11 windows smaller than 2x2 to 800x800, and Wine follows | zero-size filter (`LD_PRELOAD`) keeps windows smaller than 2x2 unmapped |
 
 ## 1. ICU error in the installer
 
@@ -125,7 +128,7 @@ its registry key).
 ## 6. Browser sign-in: nothing opens (Wine `start.exe` overflow)
 
 With browser sign-in on, Altium shows "Use your browser to sign in" and nothing opens.
-The installer's sign-in step does the same.
+The installer's sign-in step does the same (fixed separately, §26).
 
 `Altium.Identity.Authentication.OpenBrowser` runs `cmd /c start <url>`. Running the
 installer's `Authorizer.exe` under `WINEDEBUG=+start,+seh` shows:
@@ -1133,3 +1136,91 @@ not exist: with the filter, `wininfo.exe` lists the monitors and the log reads
 exists`; with `--control`, without it, Xlib ends the process, as it ended explorer after the
 unplug. [`tests/test_xrandrfilter.py`](../tests/test_xrandrfilter.py) checks on the host which
 errors are dropped and which reach the program's handler.
+
+## 26. Installer sign-in: nothing opens (32-bit `start.exe`)
+
+The online installer (`AltiumDesignerSetup_26_11_1.exe`) has to sign in before it can
+download anything. Its Sign In dialog says "Use your browser to complete the sign in
+process", no browser opens, and five minutes later a warning says "Time to login has
+expired, please try again". The offline installer shows the same step; running it a second
+time skipped it.
+
+The installer unpacks itself into `%TEMP%\{GUID}.ai\` and signs in through `Authorizer.exe`
+from there (`Authorizer.exe <id> https://auth.altium.com https://actionwait.altium.com/await`),
+a 32-bit .NET program that opens the sign-in page as Altium does, with `cmd /c start <url>`.
+Wine's `start.exe` then crashes on the URL (§6). The `cmd.exe` shim of §6 does not reach it:
+`CreateProcess` looks for `cmd` in the program's own folder first, and that is a new
+temporary folder each time. But 32-bit `cmd.exe` runs its `start` built-in as
+`<system folder>\start.exe` (`WCMD_start()` in programs/cmd/builtins.c), which for a
+32-bit process is always `C:\windows\syswow64\start.exe`.
+
+**Fix:** [`src/startshim`](../src/startshim/startshim.c), a `start.exe` installed in
+`syswow64`. If its command line is `start ["title"] [options] <http(s) url>`, it opens the
+URL with `ShellExecuteExW`, as the `cmd.exe` shim does. Any other command line goes,
+unchanged, to Wine's own `start.exe`: the shim is a 64-bit program, so `system32` is the
+64-bit folder, whose `start.exe` is Wine's. It waits for it and returns its exit code, as
+cmd's `start` waits for `start.exe`. 64-bit programs, and Bottles, which starts programs
+with `start /unix`, use `system32\start.exe` and never see the shim. When Wine updates the
+prefix it leaves files that are not its own stubs alone. From 32-bit and 64-bit `cmd`,
+`start /wait` (exit code 7 passed through), `/d`, a title and a missing program give the
+same results. With the shim, the installer's Sign In opened the browser, and the installer
+went on to download and install Altium 26.11.1.
+
+## 27. Orange box over the installer's dialogs (Hyprland ignores window opacity)
+
+Clicking Sign In in the installer opened an orange box over the Sign In dialog, slightly
+larger than it, so the dialog could be neither seen nor clicked; the "Time to login has
+expired" warning got one too. `wininfo.exe` shows a `TBehindWindow` behind each dialog
+(`TSignInUnifiedForm`, `TMessageBoxForm`), 4 px larger on every side, with
+`WS_EX_LAYERED`. Its X11 window has `_NET_WM_WINDOW_OPACITY` = `0x9F9F9F9F` (62%): on
+Windows it is a translucent orange glow under the dialog. Hyprland ignores
+`_NET_WM_WINDOW_OPACITY` (a screenshot of the box is flat orange) and puts the newest
+window on top. The glow is shown after its dialog, so it covers the dialog and takes the
+focus.
+
+Window rules cannot tell the glow from its dialog: same class, both untitled, both
+`_NET_WM_WINDOW_TYPE_DIALOG`. Sending the warning's glow to the back by hand
+(`hyprctl dispatch 'hl.dsp.window.alter_zorder({ mode = "bottom", window = "address:…" })'`)
+made the warning readable.
+
+**Fix:** a `window.open` hook in
+[`config/hyprland/altium.lua`](../config/hyprland/altium.lua). When an Altium window opens
+exactly around another one (the same margin of 1 to 8 px on every side, give or take a
+pixel for scaled monitors), it goes to the bottom of the stack and the focus goes to the
+window inside; when a window opens inside such a frame, the frame goes to the bottom.
+
+## 28. A white 800x800 box next to the installer (zero-size windows on Hyprland)
+
+While the installer ran, an empty white 800x800 window sat next to it. It is the
+installer's `TApplication` window: Delphi programs create it visible but 0x0 at the centre
+of the screen, and on Windows nothing shows. Wine maps a window with an empty rectangle
+when it is on screen (`is_window_rect_mapped()`), as a 1x1 X11 window. Hyprland configures
+every managed X11 window smaller than 2x2 that asks to be mapped to 800x800, or to its base
+size from `WM_NORMAL_HINTS` when that is larger than 5x5 (`CXWM::handleMapRequest()` in
+src/xwayland/XWM.cpp: "default to 800 x 800"). Wine takes the new size from the
+ConfigureNotify (`window_update_client_config()`), so for Windows too the window is now
+800x800 (`wininfo.exe`: `[1280,720 800x800] … cls=TApplication`), with `WM_NORMAL_HINTS`
+min = max = 800x800, as it cannot be resized. A Hyprland hook cannot catch it: by the time
+`window.open` fires, Hyprland has already resized it.
+
+**Fix:** [`src/zerosize`](../src/zerosize/zerosize.c), an `LD_PRELOAD` library. `winex11.so`
+links `XMapWindow` from libX11 directly, so the library wraps it: a managed top-level window
+smaller than 2x2 is not mapped, only remembered, and it is mapped as soon as Wine gives it a
+real size (`XConfigureWindow`, `XMoveResizeWindow`). Override-redirect windows are left
+alone: Hyprland does not resize them, and Wine maps its own 1x1 dummy parent window, which
+must stay mapped. After a map, Wine waits for the window manager's `WM_STATE` before it
+applies further state changes to that window (`window_set_wm_state()`), so it holds them
+back for a window that is never mapped; for an invisible window that changes nothing.
+Requests that need a viewable window, such as `XSetInputFocus`, fail with `BadMatch`, which
+Wine's error handler ignores. The library logs each window it holds to
+`<bottle>/altium-on-linux/logs/zero-size.log`; `ALTIUM_ZERO_SIZE=off` turns it off.
+
+The installer is 32-bit, and this runner runs 32-bit programs in 32-bit Linux processes:
+the dynamic loader skips the 64-bit fd guard and XRandR filter there (`wrong ELF class:
+ELFCLASS64`). So the library is built for both, without libc headers or libraries (the
+32-bit build needs no 32-bit development files), and `LD_PRELOAD` names it through `$LIB`,
+which the loader in the Bottles runtime expands to `lib/x86_64-linux-gnu` or
+`lib/i386-linux-gnu`. `$PLATFORM` would not do: in 64-bit processes it is a CPU level
+(`haswell` here), not `x86_64`. With the filter, the installer opened without the white
+box, every process of the bottle loaded its own build, and the log read
+`kept unmapped window 0x2e00005 (1x1) in AltiumDesignerS`.

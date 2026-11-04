@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Apply the Altium-on-Wine fixes to a Bottles (Flatpak) bottle in which Altium
-# Designer is already installed. Safe to re-run. See README.md for what each fix does.
+# Apply the Altium-on-Wine fixes to a Bottles (Flatpak) bottle. Run it twice: before
+# installing Altium (it prepares the bottle for the installer) and after (it adds the
+# fixes that go into Altium's folder). Safe to re-run. See README.md for each fix.
 #
 #   scripts/install.sh [--bottle NAME] [--altium-dir AD26] [--no-fonts] [--dry-run]
 set -euo pipefail
@@ -17,7 +18,7 @@ SELAWIK_URL=https://github.com/microsoft/Selawik/releases/download/1.01/Selawik_
 SELAWIK_SHA256=3f62c51e05e3b5a1e6241cf92a371f0be2ea1183aa87b30718bbd40832a8d423
 
 usage() {
-    sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -40,11 +41,26 @@ quiet() {
     rm -f "$log"
 }
 
-load_bottle "$BOTTLE" "$ALTIUM_DIR"
+# install_file SRC DEST: copy, keeping a different existing file as DEST.bak (Altium and
+# Wine ship none of the files replaced here, or only Wine's stub, so it is the original or
+# a copy from an earlier run).
+install_file() {
+    if [ -f "$2" ] && ! cmp -s "$1" "$2"; then
+        run cp -p "$2" "$2.bak"
+    fi
+    run cp "$1" "$2"
+}
 
-say "Bottle '$BOTTLE' (runner $RUNNER), Altium in Program Files/Altium/$ALTIUM_DIR"
+load_bottle_dir "$BOTTLE"
+if find_altium "$ALTIUM_DIR"; then
+    say "Bottle '$BOTTLE' (runner $RUNNER), Altium in Program Files/Altium/$ALTIUM_DIR"
+else
+    [ -z "$ALTIUM_DIR" ] || die "Altium Designer not found in $AD (check --altium-dir)"
+    AD=
+    say "Bottle '$BOTTLE' (runner $RUNNER), Altium not installed yet: preparing the bottle for the installer"
+fi
 if [ -n "$(bottle_pids)" ]; then
-    [ "$DRY" = 1 ] || die "the bottle is running: close Altium (and wait a few seconds for Wine to exit)"
+    [ "$DRY" = 1 ] || die "the bottle is running: close Altium or its installer (and wait a few seconds for Wine to exit)"
     echo "    (the bottle is running; a real install would stop here)"
 fi
 if pgrep -f '/app/bin/bottles( |$)' >/dev/null; then
@@ -63,15 +79,18 @@ wine_in_bottle() {
 say "Building the Windows binaries"
 quiet "$ROOT/scripts/build.sh"
 
-say "Installing cmd.exe shim, SHFolder.dll proxy and dxvk.conf into $ALTIUM_DIR"
-# Altium ships none of these, so an existing copy is from an earlier run: keep it as .bak.
-for f in build/cmd.exe build/SHFolder.dll config/dxvk.conf; do
-    dest="$AD/$(basename "$f")"
-    if [ -f "$dest" ] && ! cmp -s "$ROOT/$f" "$dest"; then
-        run cp -p "$dest" "$dest.bak"
-    fi
-    run cp "$ROOT/$f" "$dest"
-done
+if [ -n "$AD" ]; then
+    say "Installing cmd.exe shim, SHFolder.dll proxy and dxvk.conf into $ALTIUM_DIR"
+    for f in build/cmd.exe build/SHFolder.dll config/dxvk.conf; do
+        install_file "$ROOT/$f" "$AD/$(basename "$f")"
+    done
+fi
+
+# 32-bit cmd.exe runs `start` as syswow64\start.exe: the installer's sign-in (Authorizer.exe,
+# 32-bit) opens the browser through it. Wine keeps a file that is not one of its stubs when
+# it updates the prefix.
+say "Installing the start.exe shim for 32-bit programs (the installer's sign-in)"
+install_file "$ROOT/build/start.exe" "$BOTTLE_DIR/drive_c/windows/syswow64/start.exe"
 
 # Implicit Vulkan layer for the bottle only, found through VK_ADD_IMPLICIT_LAYER_PATH (set below).
 say "Installing the present-wait Vulkan layer into $STAGE/vulkan"
@@ -81,11 +100,20 @@ run cp "$ROOT/build/VkLayer_altium_present_wait.so" "$ROOT/src/presentwait/VkLay
 # Preloaded into the bottle's Wine processes (LD_PRELOAD, set below): the fd guard keeps
 # stray closes, Wine's own among them, off Wine's server pipes, which froze Altium (logs to
 # $STAGE/logs/fd-guard.log); the XRandR filter hides 0x0 monitors, on which Wine divides
-# by zero (logs to $STAGE/logs/xrandr-filter.log).
-say "Installing the fd guard and the XRandR filter into $STAGE/fdguard"
+# by zero (logs to $STAGE/logs/xrandr-filter.log). Both are 64-bit, like Altium. The
+# zero-size filter keeps 0x0 windows unmapped, which Hyprland would blow up to 800x800
+# (logs to $STAGE/logs/zero-size.log); the installer is 32-bit, so it comes in both, and
+# the dynamic loader picks the process's own through $LIB, which in the Bottles Flatpak
+# runtime is lib/x86_64-linux-gnu or lib/i386-linux-gnu ($PLATFORM would depend on the CPU).
+say "Installing the fd guard, the XRandR filter and the zero-size filter into $STAGE"
 run mkdir -p "$STAGE/fdguard" "$STAGE/logs"
 run cp "$ROOT/build/altium_fd_guard.so" "$ROOT/build/altium_xrandr_filter.so" "$STAGE/fdguard/"
-PRELOAD=$STAGE/fdguard/altium_fd_guard.so:$STAGE/fdguard/altium_xrandr_filter.so
+for arch in x86_64 i386; do
+    run mkdir -p "$STAGE/zerosize/lib/$arch-linux-gnu"
+    run cp "$ROOT/build/${arch/i386/i686}/altium_zero_size.so" "$STAGE/zerosize/lib/$arch-linux-gnu/"
+done
+# shellcheck disable=SC2016 # $LIB is for the dynamic loader
+PRELOAD=$STAGE/fdguard/altium_fd_guard.so:$STAGE/fdguard/altium_xrandr_filter.so:$STAGE/zerosize/'$LIB'/altium_zero_size.so
 
 run cp "$ROOT/registry/altium-fixes.reg" "$STAGE/"
 regs=(altium-fixes.reg)
@@ -108,10 +136,11 @@ if [ "$FONTS" = 1 ]; then
     regs+=(fonts.reg)
 fi
 
-# "Altium Designer {GUID}" keys of the installations that have already run once.
+# "Altium Designer {GUID}" keys of the installations: the installer creates one (the online
+# installer stores its sign-in there), Altium creates it on its first start otherwise.
 mapfile -t install_keys < <(grep -oE '^\[Software\\\\Altium\\\\Altium Designer \{[0-9A-Fa-f-]+\}' "$BOTTLE_DIR/user.reg" \
     | sed -E 's/^\[Software\\\\Altium\\\\//' | sort -u)
-if [ "${#install_keys[@]}" -gt 0 ]; then
+if [ -n "$AD" ] && [ "${#install_keys[@]}" -gt 0 ]; then
     for key in "${install_keys[@]}"; do
         name="unified-login-$(grep -oE '[0-9A-Fa-f-]{36}' <<< "$key").reg"
         if [ "$DRY" = 1 ]; then echo "    + write $STAGE/$name for $key"
@@ -131,25 +160,48 @@ quiet flatpak run --command=bottles-cli "$APP" edit -b "$BOTTLE" --env-var Steam
 quiet flatpak run --command=bottles-cli "$APP" edit -b "$BOTTLE" --env-var VK_ADD_IMPLICIT_LAYER_PATH="$STAGE/vulkan"
 quiet flatpak run --command=bottles-cli "$APP" edit -b "$BOTTLE" --env-var LD_PRELOAD="$PRELOAD"
 
+# Bottles lists a bottle's programs from their Start Menu shortcuts, but Altium's points at
+# X2.exe and the file is X2.EXE, which a case-sensitive file system does not match.
+if [ -n "$AD" ]; then
+    programs=$(flatpak run --command=bottles-cli "$APP" -j programs -b "$BOTTLE" 2>/dev/null || true)
+    if ! python3 -c 'import json, sys
+sys.exit(0 if any(p.get("path") == sys.argv[1] for p in json.loads(sys.stdin.read() or "[]")) else 1)' \
+        "$AD/X2.EXE" <<< "$programs" 2>/dev/null; then
+        say "Adding Altium Designer to the bottle's programs"
+        quiet flatpak run --command=bottles-cli "$APP" add -b "$BOTTLE" -n "Altium Designer" -p "$AD/X2.EXE"
+    fi
+fi
+
 if [ "$DRY" = 0 ]; then
     say "Checking"
     check() { if grep -qF "$2" "$3"; then echo "    ok   $1"; else echo "    MISSING $1"; fi; }
+    check_file() { if cmp -s "$2" "$3"; then echo "    ok   $1"; else echo "    MISSING $1"; fi; }
     check "tabtip.exe disabled" '"tabtip.exe"=""' "$BOTTLE_DIR/user.reg"
     check "WPF software rendering" '"DisableHWAcceleration"=dword:00000001' "$BOTTLE_DIR/user.reg"
     check "SHFolder proxy override" '"shfolder"="native,builtin"' "$BOTTLE_DIR/user.reg"
     check "real display modes" '"EmulateModeset"="N"' "$BOTTLE_DIR/user.reg"
     [ "$FONTS" = 0 ] || check "Segoe UI font" '"Segoe UI (TrueType)"="segoeui-selawik.ttf"' "$BOTTLE_DIR/system.reg"
-    [ "${#install_keys[@]}" -eq 0 ] || check "browser sign-in" '"UnifiedLogin"="1"' "$BOTTLE_DIR/user.reg"
+    check_file "start.exe shim (installer sign-in)" "$ROOT/build/start.exe" "$BOTTLE_DIR/drive_c/windows/syswow64/start.exe"
+    if [ -n "$AD" ]; then
+        check_file "cmd.exe shim (Altium sign-in)" "$ROOT/build/cmd.exe" "$AD/cmd.exe"
+        check_file "SHFolder.dll proxy" "$ROOT/build/SHFolder.dll" "$AD/SHFolder.dll"
+        [ "${#install_keys[@]}" -eq 0 ] || check "browser sign-in" '"UnifiedLogin"="1"' "$BOTTLE_DIR/user.reg"
+    fi
     check "SteamAppId" 'SteamAppId: altium' "$BOTTLE_DIR/bottle.yml"
     check "present-wait layer" "VK_ADD_IMPLICIT_LAYER_PATH: $STAGE/vulkan" "$BOTTLE_DIR/bottle.yml"
-    check "fd guard and XRandR filter" "LD_PRELOAD: $PRELOAD" "$BOTTLE_DIR/bottle.yml"
+    check "fd guard, XRandR and zero-size filters" "LD_PRELOAD: $PRELOAD" "$BOTTLE_DIR/bottle.yml"
 fi
 
 echo
-if [ "${#install_keys[@]}" -eq 0 ]; then
-    echo "Altium has not run in this bottle yet, so browser sign-in could not be switched on."
-    echo "Start Altium once, close it, and run this script again (or enable System.UnifiedLogin"
-    echo "under Preferences > System > General > Advanced)."
+if [ -z "$AD" ]; then
+    echo "The bottle is ready for the Altium Designer installer. Next: run the installer from"
+    echo "Bottles (README step 6), untick \"Run Altium Designer\" at the end, then run this"
+    echo "script again."
+    exit 0
 fi
-echo "Hyprland users: add config/hyprland/altium.lua to ~/.config/hypr/hyprland.lua."
+if [ "${#install_keys[@]}" -eq 0 ]; then
+    echo "Altium's settings are not in the registry yet, so browser sign-in could not be switched"
+    echo "on. Start Altium once, close it, and run this script again (or enable"
+    echo "System.UnifiedLogin under Preferences > System > General > Advanced)."
+fi
 echo "Done. Start Altium from Bottles."

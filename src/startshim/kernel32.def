@@ -1,0 +1,13 @@
+LIBRARY kernel32.dll
+EXPORTS
+GetCommandLineW
+GetSystemDirectoryW
+GetModuleFileNameW
+GetStartupInfoW
+CreateProcessW
+WaitForSingleObject
+GetExitCodeProcess
+CloseHandle
+GetProcessHeap
+HeapAlloc
+ExitProcess

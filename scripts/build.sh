@@ -2,14 +2,15 @@
 # Build the Windows binaries (64-bit PE) with clang + lld-link. No Windows SDK,
 # MinGW or C runtime is needed: each source declares the few APIs it uses and
 # links against import libraries generated from the .def files next to it.
-# Also builds the Linux Vulkan layer (no Vulkan headers needed either), the fd guard and
-# the XRandR filter.
+# Also builds the Linux Vulkan layer (no Vulkan headers needed either), the fd guard, the
+# XRandR filter and the zero-size window filter.
 #
-#   scripts/build.sh            -> build/cmd.exe, build/SHFolder.dll,
+#   scripts/build.sh            -> build/cmd.exe, build/start.exe, build/SHFolder.dll,
 #                                  build/wininfo.exe, build/clearex.exe, build/postmsg.exe,
 #                                  build/displayfix.exe, build/onscreen.exe,
 #                                  build/VkLayer_altium_present_wait.so, build/altium_fd_guard.so,
-#                                  build/altium_xrandr_filter.so
+#                                  build/altium_xrandr_filter.so,
+#                                  build/{x86_64,i686}/altium_zero_size.so
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -47,6 +48,8 @@ link_exe() {
 
 link_exe cmd start_entry "$SRC/cmdshim/cmdshim.c" \
     "$SRC/cmdshim/kernel32.def" "$SRC/cmdshim/shell32.def"
+link_exe start start_entry "$SRC/startshim/startshim.c" \
+    "$SRC/startshim/kernel32.def" "$SRC/startshim/shell32.def"
 
 clang "${CFLAGS[@]}" -c "$SRC/shfolderproxy/shfolderproxy.c" -o "$OBJ/shfolderproxy.obj"
 lld-link /nologo /Brepro /dll /entry:DllMain /nodefaultlib /machine:x64 \
@@ -72,5 +75,12 @@ clang -shared -fPIC -O2 -fvisibility=hidden -fno-stack-protector -U_FORTIFY_SOUR
     -o "$OUT/altium_fd_guard.so" "$SRC/fdguard/fdguard.c"
 clang -shared -fPIC -O2 -fvisibility=hidden -fno-stack-protector -U_FORTIFY_SOURCE -Wall -Wextra -Werror \
     -o "$OUT/altium_xrandr_filter.so" "$SRC/xrandrfilter/xrandrfilter.c"
+# Also preloaded into 32-bit Wine processes (the installer), so built for both; it uses no
+# libc headers or libraries, so -m32 needs no 32-bit development files.
+for arch in x86_64:-m64 i686:-m32; do
+    mkdir -p "$OUT/${arch%%:*}"
+    clang "${arch#*:}" -shared -fPIC -nostdlib -O2 -fvisibility=hidden -fno-stack-protector -Wall -Wextra -Werror \
+        -o "$OUT/${arch%%:*}/altium_zero_size.so" "$SRC/zerosize/zerosize.c"
+done
 
-ls -l "$OUT"/*.exe "$OUT"/*.dll "$OUT"/*.so
+ls -l "$OUT"/*.exe "$OUT"/*.dll "$OUT"/*.so "$OUT"/*/altium_zero_size.so

@@ -11,25 +11,38 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 # Windows path (Z:\...) of a host path, for programs running inside the bottle.
 winpath() { printf 'Z:%s' "${1//\//\\}"; }
 
-# load_bottle NAME [ALTIUM_DIR]
-# Sets BOTTLE_DIR, RUNNER, RUNNER_DIR, ALTIUM_DIR, AD (Altium's folder on the host)
-# and STAGE (a folder inside the bottle that the Bottles sandbox can read and write;
-# the sandbox has no access to this repository).
-load_bottle() {
+# load_bottle_dir NAME
+# Sets BOTTLE_DIR, RUNNER, RUNNER_DIR and STAGE (a folder inside the bottle that the
+# Bottles sandbox can read and write; the sandbox has no access to this repository).
+load_bottle_dir() {
     BOTTLE_DIR=$DATA/bottles/$1
     [ -f "$BOTTLE_DIR/bottle.yml" ] || die "no Bottles bottle named '$1' in $DATA/bottles (use --bottle)"
     RUNNER=$(sed -n 's/^Runner: //p' "$BOTTLE_DIR/bottle.yml")
     RUNNER_DIR=$DATA/runners/$RUNNER
     [ -x "$RUNNER_DIR/bin/wine" ] || die "runner '$RUNNER' not found in $DATA/runners"
-    local altium_root="$BOTTLE_DIR/drive_c/Program Files/Altium"
-    ALTIUM_DIR=${2:-}
+    STAGE=$BOTTLE_DIR/altium-on-linux
+}
+
+# find_altium [ALTIUM_DIR]
+# Sets ALTIUM_DIR (the newest AD* folder unless given) and AD (Altium's folder on the
+# host); fails if Altium Designer is not installed in the bottle (after load_bottle_dir).
+ALTIUM_ROOT_REL="drive_c/Program Files/Altium"
+find_altium() {
+    local altium_root="$BOTTLE_DIR/$ALTIUM_ROOT_REL"
+    ALTIUM_DIR=${1:-}
     if [ -z "$ALTIUM_DIR" ]; then
         ALTIUM_DIR=$(find "$altium_root" -maxdepth 2 -iname 'X2.EXE' -printf '%h\n' 2>/dev/null \
             | sort -V | tail -1 | xargs -r -d '\n' basename)
     fi
     AD="$altium_root/$ALTIUM_DIR"
-    [ -n "$ALTIUM_DIR" ] && [ -f "$AD/X2.EXE" ] || die "Altium Designer not found under $altium_root (use --altium-dir)"
-    STAGE=$BOTTLE_DIR/altium-on-linux
+    [ -n "$ALTIUM_DIR" ] && [ -f "$AD/X2.EXE" ]
+}
+
+# load_bottle NAME [ALTIUM_DIR]
+# load_bottle_dir and find_altium; dies if Altium Designer is not installed.
+load_bottle() {
+    load_bottle_dir "$1"
+    find_altium "${2:-}" || die "Altium Designer not found under $BOTTLE_DIR/$ALTIUM_ROOT_REL (use --altium-dir)"
 }
 
 # PIDs of processes running in the bottle (their WINEPREFIX is the bottle).

@@ -133,18 +133,12 @@ threads wait for the loader lock and for an Altium critical section
 Next step: confirm over long sessions that no `wine client error` comes back, and report
 the Wine bug upstream (ValveSoftware/wine).
 
-## Installer sign-in opens no browser
-
-The installer's sign-in step ("use your browser to complete the sign in process")
-starts `Authorizer.exe`, which runs `cmd /c start <url>` and hits the same `start.exe`
-overflow as Altium (see [how-it-works.md §6](how-it-works.md#6-browser-sign-in-nothing-opens-wine-startexe-overflow)).
-The `cmd.exe` shim does not help here: `Authorizer.exe` is 32-bit and runs from a
-temporary folder the installer creates. Running the installer again skipped the
-sign-in step and installed normally; sign in afterwards from Altium.
-
 ## Smaller things
 
-- **Orange box** at the bottom-left of the PCB view, origin unknown.
+- **Orange box** at the bottom-left of the PCB view, origin unknown. It may be the glow that
+  Altium puts behind its dialogs, left behind by one
+  ([how-it-works §27](how-it-works.md#27-orange-box-over-the-installers-dialogs-hyprland-ignores-window-opacity));
+  not checked.
 - **"Not Signed In"** after starting Altium with a file on the command line; the license
   still works. Sign in from the account menu if needed.
 - **`Runtime error 217` when starting Altium** (once): the previous session's wineserver
