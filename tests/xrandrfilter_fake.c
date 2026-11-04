@@ -1,7 +1,7 @@
 /* Stand-in for libXrandr in tests/test_xrandrfilter.py: four outputs on one screen.
  * 1: connected, CRTC 11 at 1920x1080; 2: connected, CRTC 12 with a 0x0 mode (a monitor
  * Hyprland could not bring up, as XWayland lists it); 3: connected, no CRTC (switched
- * off); 4: disconnected. */
+ * off); 4: disconnected. RandR's error codes start at 147. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -61,3 +61,11 @@ XRRCrtcInfo *XRRGetCrtcInfo(void *dpy, void *resources, XID crtc)
 
 void XRRFreeCrtcInfo(XRRCrtcInfo *info) { crtc_frees++; free(info); }
 void XRRFreeOutputInfo(XRROutputInfo *info) { free(info->name); free(info); }
+
+int XRRQueryExtension(void *dpy, int *event_base, int *error_base)
+{
+    (void)dpy;
+    *event_base = 89;
+    *error_base = 147;
+    return 1;
+}

@@ -5,7 +5,8 @@
  * X2.EXE is loaded early. Its exports forward to shell32 like Wine's own
  * shfolder. On load it works around six Wine gaps, in X2.EXE and in every DLL
  * loaded later (via LdrRegisterDllNotification), one VCL bug that shows up
- * under Wine (7), a Wine-on-DXVK slowdown (8) and a race in DXVK (9):
+ * under Wine (7), a Wine-on-DXVK slowdown (8), a race in DXVK (9) and windows
+ * that Wine leaves on no monitor after a display change (10):
  *
  * 1. Missing user32 functions. Altium delay-loads a few newer user32 functions
  *    that Wine does not export (InheritWindowMonitor is still a stub in upstream
@@ -85,6 +86,12 @@
  *    a buffer on the UI thread at that moment, the free list is corrupted and the next
  *    allocation crashes. Once DXVK's d3d11.dll is loaded, its two import functions are found
  *    by their code and run with the allocator's mutex held, as upstream DXVK now does.
+ *
+ * 10. Altium disappearing when a monitor is unplugged. When the origin of Wine's coordinates
+ *    moves (the primary monitor, or a monitor left of it, goes away), Wine keeps window
+ *    positions, and a window left on no monitor is unmapped. A thread with a hidden window
+ *    watches the monitor layout and then moves Altium's windows that lie on no monitor onto
+ *    the nearest one, as Windows does, and has Wine rebuild and redraw them.
  *
  * Build: scripts/build.sh (clang + lld-link + llvm-dlltool; no Windows SDK or CRT needed).
  */
@@ -1597,6 +1604,234 @@ static void patch_dxvk_allocator(BYTE *base)
         OutputDebugStringA("shfolderproxy: DXVK allocator imports locked in d3d11.dll\n");
 }
 
+/* ---- 10. Windows left on no monitor after a display change ------------------- */
+
+/* Wine's coordinates have the primary monitor's top-left corner at (0,0). When a monitor goes
+ * away or another one becomes primary, that origin moves, but Wine keeps each window's position
+ * in them, and winex11 unmaps a window that then lies entirely off-screen. With the external
+ * monitor as primary (docs/how-it-works.md §17), unplugging it left Altium's main window, which
+ * was on the laptop, at x -2862 where there is no monitor: Altium disappeared. Windows moves such
+ * windows onto a remaining monitor itself.
+ *
+ * A thread of the proxy owns a hidden top-level window and looks at the layout of the monitors
+ * (virtual screen, primary size, monitor count) four times a second: Wine broadcasts
+ * WM_DISPLAYCHANGE for a mode change, but sent none when the dock was unplugged, while this
+ * process already had the new layout. For a few seconds after a change or a WM_DISPLAYCHANGE (the
+ * monitor list can be rebuilt again, by scripts/refresh-displays.sh), the thread moves every
+ * visible top-level window of this process that lies on no monitor, keeping its size, the least
+ * needed to fit the nearest monitor's work area. Minimized windows (Windows parks them at -32000)
+ * and windows partly on a monitor are left alone. The move is posted to the window's thread
+ * (SWP_ASYNCWINDOWPOS), so this thread never waits for Altium's. After a move or a layout
+ * change, Wine is made to rebuild each window's surface for the current screen (refresh_surface),
+ * and the windows are redrawn, three times while Hyprland maps and tiles them: without that, the
+ * PCB view came back as a black box, with stale strips along the edges of the window. */
+
+typedef void *HMONITOR;
+typedef struct { DWORD size; RECT monitor, work; DWORD flags; } MONITORINFO;
+typedef struct {
+    unsigned style;
+    WNDPROC proc;
+    int class_extra, window_extra;
+    HMODULE instance;
+    HANDLE icon, cursor, background;
+    const WCHAR *menu_name, *class_name;
+} WNDCLASSW;
+typedef struct {
+    HWND hwnd;
+    unsigned message;
+    WPARAM wparam;
+    LPARAM lparam;
+    DWORD time;
+    POINT pt;
+    DWORD private;
+} MSG;
+
+IMPORT DWORD GetCurrentProcessId(void);
+
+static WORD (*RegisterClassW)(const WNDCLASSW *cls);
+static HWND (*CreateWindowExW)(DWORD ex_style, const WCHAR *cls, const WCHAR *name, DWORD style, int x, int y,
+                               int cx, int cy, HWND parent, HANDLE menu, HMODULE instance, void *param);
+static LRESULT (*DefWindowProcW)(HWND hwnd, unsigned msg, WPARAM wp, LPARAM lp);
+static BOOL (*GetMessageW)(MSG *msg, HWND hwnd, unsigned first, unsigned last);
+static LRESULT (*DispatchMessageW)(const MSG *msg);
+static ULONGLONG (*SetTimer)(HWND hwnd, ULONGLONG id, unsigned ms, void *proc);
+static BOOL (*EnumWindows)(BOOL (*cb)(HWND hwnd, LPARAM param), LPARAM param);
+static DWORD (*GetWindowThreadProcessId)(HWND hwnd, DWORD *pid);
+static BOOL (*IsIconic)(HWND hwnd);
+static HMONITOR (*MonitorFromRect)(const RECT *rect, DWORD flags);
+static BOOL (*GetMonitorInfoW)(HMONITOR monitor, MONITORINFO *info);
+static int (*GetSystemMetrics)(int index);
+
+#define WS_POPUP 0x80000000
+#define WM_TIMER 0x0113
+#define WM_DISPLAYCHANGE 0x007e
+#define MONITOR_DEFAULTTONULL 0
+#define MONITOR_DEFAULTTONEAREST 2
+#define SWP_FRAMECHANGED 0x0020
+#define SWP_ASYNCWINDOWPOS 0x4000
+#define RDW_ERASE 0x04
+#define RDW_ALLCHILDREN 0x80
+#define RDW_FRAME 0x400
+#define DISPLAY_CHECK_TIMER 1
+#define DISPLAY_CHECK_MS 250
+#define DISPLAY_CHECKS 20 /* 5 s after the last display change */
+#define LAST_REDRAW_TICK 8 /* redraws 1, 3 and 8 ticks (0.25, 0.75 and 2 s) after a change */
+
+/* SM_CXSCREEN, SM_CYSCREEN (the primary monitor), SM_X/Y/CX/CYVIRTUALSCREEN, SM_CMONITORS */
+static const int layout_metrics[] = { 0, 1, 76, 77, 78, 79, 80 };
+static int layout[sizeof(layout_metrics) / sizeof(layout_metrics[0])];
+static int display_checks_left;
+static int ticks_since_change = -1; /* -1: no redraw pending */
+
+static int display_watch_ready(void)
+{
+    static const struct { const char *name; void **fn; } fns[] = {
+        { "RegisterClassW", (void **)&RegisterClassW },
+        { "CreateWindowExW", (void **)&CreateWindowExW },
+        { "DefWindowProcW", (void **)&DefWindowProcW },
+        { "GetMessageW", (void **)&GetMessageW },
+        { "DispatchMessageW", (void **)&DispatchMessageW },
+        { "SetTimer", (void **)&SetTimer },
+        { "EnumWindows", (void **)&EnumWindows },
+        { "GetWindowThreadProcessId", (void **)&GetWindowThreadProcessId },
+        { "IsIconic", (void **)&IsIconic },
+        { "MonitorFromRect", (void **)&MonitorFromRect },
+        { "GetMonitorInfoW", (void **)&GetMonitorInfoW },
+        { "GetSystemMetrics", (void **)&GetSystemMetrics },
+    };
+    HMODULE user32;
+    int ok;
+
+    if (!user32_ready()) return 0;
+    ok = !!(user32 = GetModuleHandleW(L"user32.dll"));
+    for (unsigned i = 0; ok && i < sizeof(fns) / sizeof(fns[0]); i++) ok = !!(*fns[i].fn = GetProcAddress(user32, fns[i].name));
+    return ok;
+}
+
+/* Keep the window's size; move it as little as needed to fit the monitor's work area. */
+static int clamp_to_work_area(int pos, int size, int lo, int hi)
+{
+    if (pos > hi - size) pos = hi - size;
+    if (pos < lo) pos = lo;
+    return pos;
+}
+
+static BOOL move_onto_monitor(HWND hwnd, LPARAM param)
+{
+    MONITORINFO mi;
+    RECT r;
+    DWORD pid = 0;
+    int x, y;
+
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd) || IsIconic(hwnd) || !GetWindowRect(hwnd, &r)) return 1;
+    /* Empty windows (Delphi's TApplication) are never mapped. */
+    if (r.right <= r.left || r.bottom <= r.top || MonitorFromRect(&r, MONITOR_DEFAULTTONULL)) return 1;
+    mi.size = sizeof(mi);
+    if (!GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi)) return 1;
+    x = clamp_to_work_area(r.left, r.right - r.left, mi.work.left, mi.work.right);
+    y = clamp_to_work_area(r.top, r.bottom - r.top, mi.work.top, mi.work.bottom);
+    if (SetWindowPos(hwnd, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS))
+        ++*(int *)param;
+    return 1;
+}
+
+/* Wine clips a window's surface (what it draws into, then copies to the X window) to the virtual
+ * screen when the window moves or changes size, and keeps it otherwise. Right after the dock was
+ * unplugged, this process still listed the dock's 1920x1080 monitor alone, Altium's main window
+ * was moved under that list, and it showed only its top-left 1920x1080, black elsewhere, until
+ * something moved it again, seconds after the list was rebuilt. SWP_FRAMECHANGED makes Wine
+ * work out the surface again without moving the window. */
+static BOOL refresh_surface(HWND hwnd, LPARAM param)
+{
+    DWORD pid = 0;
+
+    (void)param;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd) && !IsIconic(hwnd))
+        SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+    return 1;
+}
+
+/* To Altium the window never stopped being visible, so nothing repaints it once Wine maps it
+ * again: the Direct3D views stay black and other parts keep stale strips. */
+static BOOL redraw_window(HWND hwnd, LPARAM param)
+{
+    DWORD pid = 0;
+
+    (void)param;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd) && !IsIconic(hwnd))
+        RedrawWindow(hwnd, 0, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+    return 1;
+}
+
+/* Has the monitor layout changed since the last call? */
+static int layout_changed(void)
+{
+    int changed = 0;
+    for (unsigned i = 0; i < sizeof(layout) / sizeof(layout[0]); i++) {
+        int value = GetSystemMetrics(layout_metrics[i]);
+        if (value != layout[i]) changed = 1;
+        layout[i] = value;
+    }
+    return changed;
+}
+
+static LRESULT display_watch_proc(HWND hwnd, unsigned msg, WPARAM wp, LPARAM lp)
+{
+    int moved = 0;
+
+    if (msg == WM_DISPLAYCHANGE) {
+        display_checks_left = DISPLAY_CHECKS;
+    } else if (msg == WM_TIMER && wp == DISPLAY_CHECK_TIMER) {
+        /* Hyprland maps and tiles a moved window some time after the move: redraw more than once. */
+        if (ticks_since_change >= 0) {
+            ticks_since_change++;
+            if (ticks_since_change == 1 || ticks_since_change == 3 || ticks_since_change == LAST_REDRAW_TICK)
+                EnumWindows(redraw_window, 0);
+            if (ticks_since_change == LAST_REDRAW_TICK) ticks_since_change = -1;
+        }
+        if (layout_changed()) {
+            OutputDebugStringA("shfolderproxy: monitor layout changed, looking for windows on no monitor\n");
+            display_checks_left = DISPLAY_CHECKS;
+        }
+        if (display_checks_left > 0) {
+            display_checks_left--;
+            EnumWindows(move_onto_monitor, (LPARAM)&moved);
+            if (moved) OutputDebugStringA("shfolderproxy: window left on no monitor moved onto one\n");
+        }
+        /* After a move, and on the first check after any change: a rebuilt monitor list moves nothing. */
+        if (moved || display_checks_left == DISPLAY_CHECKS - 1) {
+            EnumWindows(refresh_surface, 0);
+            ticks_since_change = 0;
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* Started from DllMain; runs once the loader lock is free, for the life of the process. */
+static DWORD display_watch(void *self)
+{
+    static const WCHAR name[] = L"altium-on-linux display watch";
+    WNDCLASSW cls = { 0 };
+    HWND hwnd;
+    MSG msg;
+
+    if (!display_watch_ready()) return 1;
+    cls.proc = display_watch_proc;
+    cls.instance = self;
+    cls.class_name = name;
+    if (!RegisterClassW(&cls) || !(hwnd = CreateWindowExW(0, name, name, WS_POPUP, 0, 0, 0, 0, 0, 0, self, 0)))
+        return 1;
+    layout_changed(); /* the starting layout */
+    SetTimer(hwnd, DISPLAY_CHECK_TIMER, DISPLAY_CHECK_MS, 0);
+    while (GetMessageW(&msg, 0, 0, 0) > 0) DispatchMessageW(&msg);
+    return 0;
+}
+
 /* ---- Hooks in Wine's d2d1.dll (6 and 8) ------------------------------------ */
 
 /* On its own thread, like patch_dwrite: d2d1 cannot be used from the load notification. The
@@ -1732,7 +1967,7 @@ static void dll_loaded(DWORD reason, const DLL_NOTIFICATION_DATA *data, void *co
 BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
 {
     static void *cookie;
-    (void)self; (void)reserved;
+    (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         patch_user32_delay_imports(GetModuleHandleW(0));
         patch_nested_activation(GetModuleHandleW(0));
@@ -1743,6 +1978,7 @@ BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
         if (GetModuleHandleW(L"dwrite.dll")) dwrite_loaded(GetModuleHandleW(L"dwrite.dll"));
         if (GetModuleHandleW(L"d2d1.dll")) d2d1_loaded(GetModuleHandleW(L"d2d1.dll"));
         if (GetModuleHandleW(L"d3d11.dll")) patch_dxvk_allocator(GetModuleHandleW(L"d3d11.dll"));
+        CreateThread(0, 0, display_watch, self, 0, 0);
     }
     return 1;
 }

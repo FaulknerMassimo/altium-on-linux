@@ -33,6 +33,8 @@ soda-11.0-7 (a Proton-based Wine 11.0), DXVK 3.1, vkd3d-proton 3.0.1, Hyprland 0
 | 21 | A monitor stuck at 0x0 (a dock reconnecting): Altium starts with no window, or a running one loses all its windows; `explorer.exe` at 100% CPU, the log growing tens of MB/s | XWayland lists the monitor as connected with a 0x0 mode, and Proton's win32u divides by its width | XRandR filter (`LD_PRELOAD`) hides outputs whose CRTC is 0x0 from Wine |
 | 22 | Popups close as soon as the cursor leaves them (the PCB editor's list for picking one of several objects) | Omarchy's `input:follow_mouse = 1` focuses the main window under the cursor, and the popup closes when it loses focus | `no_follow_mouse` for `steam_app_altium` |
 | 23 | Altium crashes when a schematic is first drawn (`System.AccessViolationException`, now and then) | DXVK 3.1 imports each new swapchain's images on its command thread without its allocator's lock, while d2d1 creates buffers on the UI thread: the allocator's free list is corrupted | `SHFolder.dll` proxy runs DXVK's two import functions with the lock held, as DXVK now does upstream |
+| 24 | Unplugging the monitor Altium is on (a dock): Altium disappears | Wine keeps window positions when the origin of its coordinates moves (the primary monitor goes away), and unmaps a window left on no monitor; no `WM_DISPLAYCHANGE` arrives | `SHFolder.dll` proxy moves Altium's windows that lie on no monitor onto the nearest one; `onscreen.exe` (run by `refresh-displays.sh`) does it for every program |
+| 25 | `explorer.exe`, then Altium, exit after a monitor goes away (a dock unplugged during a suspend) | an X error Wine does not expect ends the process: `BadRROutput` for an output XWayland just removed, `BadWindow` for a window that died with explorer | XRandR filter (`LD_PRELOAD`) drops RandR errors for resources that are gone and `BadWindow` from mapping, unmapping, destroying or reparenting, and logs them |
 
 ## 1. ICU error in the installer
 
@@ -800,8 +802,8 @@ doubled. With Altium running, the original state was repaired in place, without 
 by deleting the stale `Current` value of 0cc6 and adding and removing a headless output to
 make explorer rebuild the list.
 
-Not fixed: a Wine process can exit while monitors change (see
-[known-issues.md](known-issues.md#a-wine-process-can-exit-when-a-monitor-goes-away)).
+A Wine process could also exit while monitors change, on an X error about an output that had
+just gone away; that is fixed separately (§25).
 
 ## 20. Freezes: Wine threads lose their pipes to wineserver
 
@@ -1079,3 +1081,55 @@ continues in DXVK's code. No branch in either function leads back into them. Eac
 exactly one caller (the constructors of imported images and buffers). Any other build of
 `d3d11.dll`, including a DXVK release with the fix, does not match and is left alone.
 
+## 24. Altium disappears when a monitor is unplugged (a window on no monitor)
+
+With a dock's monitor as the primary (§17) and the laptop panel to its left (Windows
+x = -2880), unplugging the dock made Altium's main window, which was on the laptop panel,
+disappear. Wine's coordinates have the primary monitor's top-left corner at (0,0). When the
+primary goes away, the laptop panel becomes primary and that origin moves, but Wine keeps
+each window's position: the main window stayed at x = -2862, where there was no monitor any
+more, and winex11 unmaps a window that lies entirely off-screen. Windows moves such windows
+onto a remaining monitor itself. Wine sent no `WM_DISPLAYCHANGE` for the unplug, although
+Altium's process already had the new layout. For about a second afterwards, every process
+but explorer still saw the old monitor list, and a window moved under it got a clipped,
+half-black surface.
+
+**Fix:** in the `SHFolder.dll` proxy (item 10), a thread with a hidden window looks at the
+monitor layout (virtual screen, primary size, monitor count) four times a second. For a few
+seconds after a change or a `WM_DISPLAYCHANGE`, it moves every visible top-level window of
+Altium that lies on no monitor onto the nearest monitor's work area, keeping its size; it
+leaves minimized windows (parked at -32000) and windows partly on a monitor alone, and posts
+the move to the window's thread (`SWP_ASYNCWINDOWPOS`) so it never waits for Altium. After a
+move or a layout change, Wine is made to rebuild each window's surface for the current screen,
+and the windows are redrawn 0.25, 0.75 and 2 s later, while Hyprland maps and tiles them:
+without that the PCB view came back as a black box. [`src/tools/onscreen.c`](../src/tools/onscreen.c)
+does the same move for every program in the bottle; `scripts/refresh-displays.sh` runs it once
+it has rebuilt Wine's monitor list (§19), and the Hyprland hook now also runs the script half a
+second after a monitor is removed, besides the run after the layout settles. After an unplug,
+the window was black from 0.7 to 1.1 s and fully drawn by 1.6 s.
+
+## 25. Wine processes exit after a monitor goes away (unexpected X errors)
+
+With the lid closed while docked, unplugging the dock suspended the laptop. On resume,
+`explorer.exe` had exited: it had read the list of outputs and then asked about one that
+XWayland had just removed (`BadRROutput` from `RRGetOutputInfo`). winex11's error handler
+passes errors it does not expect to Xlib's default handler, which ends the process; only the
+`X Error of failed request` lines in the log tell. At the next layout change Altium exited the
+same way: `BadWindow` from `UnmapWindow` of the cursor clipping window, which explorer owns and
+which had gone with it. The first of these had been seen once before, when a virtual monitor
+was removed.
+
+**Fix:** the XRandR filter ([`src/xrandrfilter`](../src/xrandrfilter/xrandrfilter.c), §21)
+wraps `XSetErrorHandler()`, so the handler Wine sets runs behind a filter. It drops RandR's
+errors for an output, CRTC, mode or provider that no longer exists (the query returns NULL,
+which winex11 handles: it lists the monitors again on the next RandR event) and `BadWindow`
+from mapping, unmapping, destroying or reparenting a window that no longer exists, and logs
+each one to `<bottle>/altium-on-linux/logs/xrandr-filter.log`. It learns RandR's error codes
+from winex11's `XRRQueryExtension()` call, and `XSetErrorHandler()` still returns the handlers
+the program set. [`tests/test_xrandrfilter_wine.py`](../tests/test_xrandrfilter_wine.py)
+`--case gone` makes the first output query of each Wine process ask about an output that does
+not exist: with the filter, `wininfo.exe` lists the monitors and the log reads
+`dropped X error 147 (request 140.9, …) in explorer.exe: a RandR resource that no longer
+exists`; with `--control`, without it, Xlib ends the process, as it ended explorer after the
+unplug. [`tests/test_xrandrfilter.py`](../tests/test_xrandrfilter.py) checks on the host which
+errors are dropped and which reach the program's handler.

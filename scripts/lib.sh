@@ -33,12 +33,10 @@ load_bottle() {
 }
 
 # PIDs of processes running in the bottle (their WINEPREFIX is the bottle).
+# One grep over every environ file: a pipeline per process took over 2 s with ~500 processes,
+# and the monitor hook (refresh-displays.sh) calls this several times.
 bottle_pids() {
-    local env pid
-    for env in /proc/[0-9]*/environ; do
-        pid=${env#/proc/}; pid=${pid%/environ}
-        tr '\0' '\n' 2>/dev/null < "$env" | grep -qxF "WINEPREFIX=$BOTTLE_DIR" && echo "$pid"
-    done
+    grep -lzxF "WINEPREFIX=$BOTTLE_DIR" /proc/[0-9]*/environ 2>/dev/null | sed 's|^/proc/||; s|/environ$||'
     return 0
 }
 
@@ -60,9 +58,11 @@ wineserver_pid() {
 }
 
 # Run a command inside the Flatpak sandbox of the bottle's running Wine session, so it
-# talks to the same wineserver. (A second `flatpak run` gets its own /tmp and would
-# start a second wineserver on the same prefix, which corrupts the registry.) Prefers the
-# wineserver's sandbox: processes of an earlier session can outlive their wineserver.
+# talks to the same wineserver. (A second `flatpak run` of Bottles 67 shares the session's
+# /tmp, and so finds its wineserver, but a second wineserver on the same prefix would
+# corrupt the registry, so this does not rely on it.) Prefers the wineserver's sandbox:
+# processes of an earlier session can outlive their wineserver; if none is left, Wine
+# starts a new wineserver there.
 # `flatpak enter` starts with an empty environment, so the session's display variables are
 # passed along (without DISPLAY, Wine falls back to a fake 1024x768 display).
 in_running_bottle() {

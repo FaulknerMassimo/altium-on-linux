@@ -12,3 +12,4 @@ GetCurrentThreadId
 GetEnvironmentVariableA
 AcquireSRWLockExclusive
 ReleaseSRWLockExclusive
+GetCurrentProcessId

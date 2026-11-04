@@ -6,11 +6,13 @@ GetClassNameA
 GetWindowTextA
 GetWindowRect
 EnumDisplayMonitors
+MonitorFromRect
 GetMonitorInfoA
 SetProcessDPIAware
 EnumDisplayDevicesA
 EnumDisplaySettingsA
 IsWindowVisible
+IsIconic
 GetWindowLongPtrA
 SetWindowLongPtrA
 SetWindowPos

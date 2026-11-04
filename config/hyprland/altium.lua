@@ -57,3 +57,9 @@ end)
 hl.on("monitor.layout_changed", function()
   hl.exec_cmd("sleep 3; " .. altium_refresh_displays)
 end)
+
+-- A monitor that goes away leaves Altium half drawn (a stale monitor list) until the resync:
+-- run it at once too; XWayland drops the output within moments, and the run above follows.
+hl.on("monitor.removed", function()
+  hl.exec_cmd("sleep 0.5; " .. altium_refresh_displays)
+end)
