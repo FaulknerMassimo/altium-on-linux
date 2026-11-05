@@ -13,3 +13,4 @@ GetEnvironmentVariableA
 AcquireSRWLockExclusive
 ReleaseSRWLockExclusive
 GetCurrentProcessId
+DisableThreadLibraryCalls

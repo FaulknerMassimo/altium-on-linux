@@ -5,8 +5,9 @@
  * X2.EXE is loaded early. Its exports forward to shell32 like Wine's own
  * shfolder. On load it works around six Wine gaps, in X2.EXE and in every DLL
  * loaded later (via LdrRegisterDllNotification), one VCL bug that shows up
- * under Wine (7), a Wine-on-DXVK slowdown (8), a race in DXVK (9) and windows
- * that Wine leaves on no monitor after a display change (10):
+ * under Wine (7), a Wine-on-DXVK slowdown (8), a race in DXVK (9), windows
+ * that Wine leaves on no monitor after a display change (10) and a deadlock
+ * between Altium's ucrtbase.dll and Wine's loader lock (11):
  *
  * 1. Missing user32 functions. Altium delay-loads a few newer user32 functions
  *    that Wine does not export (InheritWindowMonitor is still a stub in upstream
@@ -93,6 +94,15 @@
  *    watches the monitor layout and then moves Altium's windows that lie on no monitor onto
  *    the nearest one, as Windows does, and has Wine rebuild and redraw them.
  *
+ * 11. Altium hanging on start (no window, about 115 MB). Altium's own ucrtbase.dll sets up
+ *    each new thread's CRT data in DllMain(DLL_THREAD_ATTACH), under its locale lock, and Wine
+ *    calls DllMain with its loader lock held. The main thread holds the locale lock (.NET's
+ *    host, through the C++ library's _lock_locales) and meanwhile runs code that needs the
+ *    loader lock, which Wine's GetProcAddress, LoadLibrary and FindResource all take: the two
+ *    threads wait for each other. ucrtbase's thread attach and detach calls are turned off
+ *    (DisableThreadLibraryCalls): the CRT then sets a thread's data up on its first use and
+ *    frees it from its fiber-local storage callback, outside the loader lock.
+ *
  * Build: scripts/build.sh (clang + lld-link + llvm-dlltool; no Windows SDK or CRT needed).
  */
 
@@ -119,6 +129,7 @@ IMPORT HANDLE GetCurrentProcess(void);
 IMPORT BOOL FlushInstructionCache(HANDLE process, const void *addr, SIZE_T size);
 IMPORT DWORD GetCurrentThreadId(void);
 IMPORT DWORD GetEnvironmentVariableA(const char *name, char *value, DWORD size);
+IMPORT BOOL DisableThreadLibraryCalls(HMODULE module);
 
 #define PAGE_READWRITE 0x04
 #define PAGE_EXECUTE_READWRITE 0x40
@@ -1832,6 +1843,32 @@ static DWORD display_watch(void *self)
     return 0;
 }
 
+/* ---- 11. Altium's ucrtbase.dll and Wine's loader lock ------------------------- */
+
+/* Altium ships Microsoft's ucrtbase.dll (10.0.10586) and, under Wine, loads that copy. Its
+ * DllMain builds each new thread's CRT data on DLL_THREAD_ATTACH (construct_ptd: a reference to
+ * the global locale, taken under __acrt_locale_lock) and frees it on DLL_THREAD_DETACH, under the
+ * same lock. Wine calls both with its loader lock held, and Wine's LdrGetProcedureAddress,
+ * LdrLoadDll and LdrFindResource (GetProcAddress, LoadLibrary, LoadString, FindResource) take the
+ * loader lock too. Caught on 2026-11-05 (a start that hung at 115 MB, one in 11): the main thread
+ * held the locale lock twice (most likely the C++ library in .NET's hostfxr.dll, through
+ * _lock_locales) and waited for the loader lock in a resource lookup that a window message had
+ * run; a thread that X2 had just started held the loader lock in ucrtbase's DLL_THREAD_ATTACH and
+ * waited for the locale lock. Every thread that started afterwards (.NET's, Wine's thread pool)
+ * queued up behind the loader lock; Wine's pool kept adding workers, up to its limit of 500.
+ *
+ * With its thread calls turned off, ucrtbase sets up a thread's data on the thread's first use
+ * of it (__acrt_getptd, as for threads that existed before ucrtbase was loaded), and frees it
+ * from the fiber-local storage callback it registers (destroy_fls), which ntdll calls when the
+ * thread ends, before it takes the loader lock. Only Microsoft's copy: Wine's builtin ucrtbase
+ * frees its thread data on DLL_THREAD_DETACH. */
+static void ucrtbase_loaded(HMODULE base)
+{
+    if (!base || is_wine_builtin(base)) return;
+    if (DisableThreadLibraryCalls(base))
+        OutputDebugStringA("shfolderproxy: thread attach and detach calls of ucrtbase.dll turned off\n");
+}
+
 /* ---- Hooks in Wine's d2d1.dll (6 and 8) ------------------------------------ */
 
 /* On its own thread, like patch_dwrite: d2d1 cannot be used from the load notification. The
@@ -1962,6 +1999,8 @@ static void dll_loaded(DWORD reason, const DLL_NOTIFICATION_DATA *data, void *co
         d2d1_loaded(data->dll_base);
     else if (wname_is(data->base_name->buffer, data->base_name->length / 2, "d3d11.dll"))
         patch_dxvk_allocator(data->dll_base);
+    else if (wname_is(data->base_name->buffer, data->base_name->length / 2, "ucrtbase.dll"))
+        ucrtbase_loaded(data->dll_base);
 }
 
 BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
@@ -1978,6 +2017,7 @@ BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
         if (GetModuleHandleW(L"dwrite.dll")) dwrite_loaded(GetModuleHandleW(L"dwrite.dll"));
         if (GetModuleHandleW(L"d2d1.dll")) d2d1_loaded(GetModuleHandleW(L"d2d1.dll"));
         if (GetModuleHandleW(L"d3d11.dll")) patch_dxvk_allocator(GetModuleHandleW(L"d3d11.dll"));
+        ucrtbase_loaded(GetModuleHandleW(L"ucrtbase.dll"));
         CreateThread(0, 0, display_watch, self, 0, 0);
     }
     return 1;

@@ -38,6 +38,7 @@ vkd3d-proton 3.0.1, Hyprland 0.56 (Omarchy) on XWayland, Intel Arc graphics (Mes
 | 26 | Online installer: Sign In opens no browser, "Time to login has expired" | the installer's 32-bit `Authorizer.exe` runs from a new temporary folder, so the `cmd.exe` shim of §6 never reaches it; Wine's `start.exe` crashes on the URL | `start.exe` shim in `syswow64` |
 | 27 | Orange box over the installer's dialogs (Hyprland) | a translucent glow window behind each dialog; Hyprland ignores `_NET_WM_WINDOW_OPACITY` and stacks it on top | Hyprland hook sends the glow to the back |
 | 28 | Empty white 800x800 box next to the installer (Hyprland) | the installer's 0x0 `TApplication` window; Hyprland resizes managed X11 windows smaller than 2x2 to 800x800, and Wine follows | zero-size filter (`LD_PRELOAD`) keeps windows smaller than 2x2 unmapped |
+| 29 | Altium hangs on start now and then: no window, ~115 MB, `loader_section wait timed out` every 5 s | Altium's own `ucrtbase.dll` sets up each new thread's CRT data in `DllMain`, under its locale lock, and Wine calls `DllMain` with its loader lock held; the main thread held the locale lock and needed the loader lock (Wine's `GetProcAddress`, `LoadLibrary` and `FindResource` take it) | `SHFolder.dll` proxy turns `ucrtbase.dll`'s thread attach and detach calls off |
 
 ## 1. ICU error in the installer
 
@@ -1224,3 +1225,66 @@ which the loader in the Bottles runtime expands to `lib/x86_64-linux-gnu` or
 (`haswell` here), not `x86_64`. With the filter, the installer opened without the white
 box, every process of the bottle loaded its own build, and the log read
 `kept unmapped window 0x2e00005 (1x1) in AltiumDesignerS`.
+
+## 29. Altium hangs on start (Altium's `ucrtbase.dll` and Wine's loader lock)
+
+Now and then Altium never got past the start: no window (or only the splash), about 110 to
+125 MB in use, the UI thread idle. Seen from Bottles once, from `debug-launch.sh` on
+2026-10-11, and on 2026-10-28 with 500 idle `wine_threadpool` threads. Wine's log has, every
+5 s:
+
+```
+err:sync:RtlpWaitForCriticalSection section 00006FFFFFFA6440 ".../ntdll/loader.c: loader_section" wait timed out in thread 013c, blocked by 0180
+err:sync:RtlpWaitForCriticalSection section 00006FFFFE446160 "?" wait timed out in thread 0180, blocked by 013c
+```
+
+and then the same `loader_section` line for each thread that starts afterwards.
+
+It reproduced on 2026-11-05 by starting Altium again and again, headless (on an `Xvfb`
+display, in a copy of the bottle; see debugging.md): one start in 11 hung, 7 s in, at 115 MB,
+with the same two lines and the same address. The process could be read while it hung:
+
+- `00006FFFFE446160` is in the data section of Altium's own `ucrtbase.dll` (Microsoft's
+  10.0.10586, in Altium's folder; Wine loads that copy, where Windows 10 and later always
+  use the system's). `_lock_locales`, which `ucrtbase.dll` exports, enters exactly that
+  critical section: it is the CRT's locale lock (`__acrt_locale_lock`). Its owner was the
+  main thread (`013c`), which had entered it twice.
+- Thread `0180` had been started by X2.EXE (its start routine, read from the initial
+  `CONTEXT` at the top of its stack, is `X2.EXE+0x140d0`) and had not reached it: it was in
+  Wine's thread start-up, which calls every DLL's `DllMain(DLL_THREAD_ATTACH)` with the
+  loader lock held. Its stack held only ntdll frames and `ucrtbase.dll`'s module handle.
+  `ucrtbase.dll` builds a new thread's CRT data there (`construct_ptd`), and takes the
+  locale lock to give it a reference to the global locale.
+- The main thread was starting .NET (`hostfxr.dll` frames, whose C++ library takes the
+  locale lock through `_lock_locales` for `std::locale`) and, further in, ran Altium code
+  (`DXPSDK.dll`) from a window message, down to a resource lookup in user32. Wine's
+  `LdrFindResource`, `LdrGetProcedureAddress` and `LdrLoadDll` (behind `FindResource`,
+  `GetProcAddress`, `LoadLibrary`) all take the loader lock, so the main thread waited for
+  `0180`, which waited for the main thread.
+
+Every thread that started afterwards stopped in its own start-up, waiting for the loader
+lock. Wine's thread pool, seeing its workers busy, added more of them, up to its limit of 500:
+the 2026-10-28 hang. Which code on the main thread took the locale lock does not matter much:
+any thread that starts or ends while another holds that lock and needs the loader lock
+deadlocks the same way. Thread exits are no safer: `DLL_THREAD_DETACH` frees the thread's CRT
+data, under the same lock.
+
+[`tests/test_ucrt_thread_wine.py`](../tests/test_ucrt_thread_wine.py) reproduces it with the
+bottle's `ucrtbase.dll` in a throwaway prefix: with the locale lock held twice (as
+`_lock_locales` does), a thread starts and the main thread calls `LoadLibrary`, which never
+returns.
+
+**Fix:** in the `SHFolder.dll` proxy (item 11). When Microsoft's `ucrtbase.dll` is loaded
+(or already is, when the proxy loads), the proxy calls `DisableThreadLibraryCalls` on it, so
+Wine leaves it out of every thread's attach and detach calls. Nothing is lost: the CRT sets up
+a thread's data on the thread's first use of it (`__acrt_getptd`, as it does for threads that
+existed before `ucrtbase.dll` was loaded), and frees it from the fiber-local storage callback
+it registers (`destroy_fls`), which ntdll runs when the thread ends, before it takes the
+loader lock. Wine's builtin `ucrtbase.dll` is left alone (it frees its thread data in
+`DLL_THREAD_DETACH`). The test runs the proxy in both orders (loaded before `ucrtbase.dll`:
+the load notification; after it: the proxy's `DllMain`). In both, the thread starts and uses
+`errno`, `LoadLibrary` returns, and a thread with CRT data ends while the lock is held: it
+waits for the lock to free its data (so nothing leaks), and `LoadLibrary` returns meanwhile.
+In Altium, 40 headless starts in a row went through with the fix, where one in 11 had hung
+without it, and a session on the real display with a schematic and a PCB open drew both and
+exited normally.

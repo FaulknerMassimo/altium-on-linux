@@ -31,6 +31,29 @@ where they ask to be. Hyprland exports the functions involved
 `CWindowTarget::desiredGeometry`), so a plugin could hook them; not attempted. Turning off
 `force_zero_scaling` does not fix the splash (see §17).
 
+## Altium does not exit after File > Exit
+
+Seen four times (2026-10-10, -12, -23 and -24), each after a session of an hour or more:
+the documents close, the license is released (the title becomes `Altium Designer (26.x) -
+No License`), no dialog is open (`scripts/wininfo.sh` lists only `TDocumentForm` and
+`TApplication`), and the process stays, at a few percent CPU. Short sessions exit in a few
+seconds: a project, a schematic and a PCB opened and closed, and 50 headless starts and
+closes (debugging.md).
+
+Backtraces of the UI thread stopped in a different module each time (`scriptingsystem.dll`,
+`helpadvisor.dll`, `edmsinterface.dll`), but read with the code they are one place:
+X2.EXE's idle handler (`x2+0x123fbad` in 26.11.1) calls each module's idle method, which
+runs that module's own copy of VCL's `Application.Idle` (`DoMouseIdle`: `WindowFromPoint`,
+`FindDragTarget`). So the UI thread is not stuck in a module: X2's main message loop is still
+running, and idling. The exit waits for something that never happens (a background task, a
+thread, a message); what, is not known.
+
+Next time, before ending it: managed stacks of every thread (`scripts/dotnet-stacks.sh`),
+native ones (`scripts/backtrace.sh`, which can take minutes; killing `winedbg` while it is
+attached kills Altium), and `scripts/wininfo.sh`. Nothing is left to save by then, so ending
+the bottle's processes is safe:
+`bash -c 'source scripts/lib.sh; load_bottle Altium; in_running_bottle "$RUNNER_DIR/bin/wineserver" -k'`.
+
 ## An Altium session ended after the lid was closed
 
 An Altium session ended about 20 seconds after the laptop lid was closed (its `X2.EXE`
@@ -146,14 +169,6 @@ the Wine bug upstream (ValveSoftware/wine).
   helpers were still running. After ending them, Altium started. If processes are left in
   the bottle after Altium closes (`pgrep -af 'msedgewebview2|explorer.exe'`), end them
   before starting it again.
-- **Starting from Bottles once hung** at about 110 MB with no window; the process was gone
-  before it could be inspected. A second start worked. A start from `debug-launch.sh` hung
-  the same way on 2026-10-11, 0.2 s after the proxy loaded: the main thread (in
-  `LoadLibrary`, called from user32) held a lock in Altium's own `ucrtbase.dll` and waited
-  for Wine's loader lock, held by a thread that was starting (thread attach) and waited for
-  that `ucrtbase.dll` lock. Wine logs `RtlpWaitForCriticalSection ... loader_section wait
-  timed out` every 5 s. Which thread it was is not known; the proxy starts one when
-  `dwrite.dll` loads (item 3). End it with `wineserver -k` and start again.
 - **The embedded WebView2 sign-in** never renders; browser sign-in replaces it. The
   WebView2 Home page does render.
 - **A newer runner may fix some of this and break other things:** upstream Wine has

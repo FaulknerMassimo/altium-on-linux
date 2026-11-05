@@ -276,6 +276,8 @@ keep. Or delete the bottle.
 | Freezes now and then (a Wine thread loses its pipes to wineserver) | cause found: under fsync, Wine closes a random fd each time a thread ends; the fd guard skips those closes ([§20](docs/how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver)); not yet confirmed over long sessions |
 | A monitor stuck at 0x0 (a dock reconnecting) | hidden from Wine, which divided by its width and lost Altium's windows ([§21](docs/how-it-works.md#21-a-monitor-stuck-at-0x0-altium-shows-no-window-or-loses-them-all)) |
 | Unplugging a dock while Altium runs | Altium's windows move onto a remaining monitor ([§24](docs/how-it-works.md#24-altium-disappears-when-a-monitor-is-unplugged-a-window-on-no-monitor)); X errors about outputs and windows that went away no longer end Wine's processes ([§25](docs/how-it-works.md#25-wine-processes-exit-after-a-monitor-goes-away-unexpected-x-errors)) |
+| Starting Altium | the hang now and then on start (no window) is fixed ([§29](docs/how-it-works.md#29-altium-hangs-on-start-altiums-ucrtbasedll-and-wines-loader-lock)) |
+| Quitting Altium | after a long session, it sometimes stays open with `No License` in the title: [known issues](docs/known-issues.md#altium-does-not-exit-after-file--exit) |
 
 ### Tested on
 
@@ -323,6 +325,7 @@ Hyprland rules only matter on Hyprland.
 | 26 | Online installer: Sign In opens no browser, then "Time to login has expired" | `start.exe` shim in the bottle's `syswow64` folder (the installer signs in from a 32-bit helper the `cmd.exe` shim cannot reach) |
 | 27 | Orange box over the installer's dialogs, hiding the Sign In dialog (Hyprland) | Hyprland hook sends the dialog's glow window to the back |
 | 28 | Empty white 800x800 box next to the installer (Hyprland) | zero-size filter (`LD_PRELOAD`) keeps 0x0 windows unmapped, which Hyprland would resize to 800x800 |
+| 29 | Altium hangs now and then on start: no window, or only the splash | `SHFolder.dll` proxy turns off the thread start and end calls of Altium's own `ucrtbase.dll`, which take a lock that deadlocks with Wine's loader lock |
 
 [docs/how-it-works.md](docs/how-it-works.md) explains each one: symptom, root cause,
 evidence and fix.

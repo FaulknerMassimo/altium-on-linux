@@ -115,6 +115,35 @@ probably lost its pipes ([how-it-works §20](how-it-works.md#20-freezes-wine-thr
   so it shows up long before it hits something. `ALTIUM_FD_GUARD=log` (with `--env`) lets
   every close through and only logs.
 
+### A start that hangs: many starts, headless
+
+A hang that shows up once in ten starts needs many starts, and those should neither cover
+the screen nor change the bottle (Wine records every display it sees in the registry, see
+[how-it-works §19](how-it-works.md#19-altium-drawn-offset-after-a-monitor-goes-away-and-comes-back)).
+On btrfs a copy of the bottle costs nothing: `cp -a --reflink=always <bottles>/Altium
+<bottles>/AltiumTest` (then set `Name:` and `Path:` in its `bottle.yml`). Run `Xvfb :77
+-screen 0 2880x1800x24 -nolisten tcp`, and start Altium in a loop with `DISPLAY=:77`
+(unset `WAYLAND_DISPLAY`) `scripts/debug-launch.sh --bottle AltiumTest`. `wininfo.exe`
+shows when the main window (`TDocumentForm`) is up; `postmsg.exe <hwnd> 10 0 0` (WM_CLOSE)
+closes it. This is for starts only: the first frame of a schematic or PCB view ends Altium
+on Xvfb (`X connection to :77 broken`), with or without the proxy. A loader-lock deadlock
+announces itself within 5 s in the log: `RtlpWaitForCriticalSection ... wait timed out in
+thread X, blocked by Y`.
+
+Reading the hung process (`winedbg` cannot attach while the loader lock is held):
+
+- `/proc/<pid>/maps` names only the header page of most native DLLs (Wine maps their
+  sections anonymously), and Altium's paths contain spaces. Take each module's range from
+  `SizeOfImage` in its header, read from `/proc/<pid>/mem` at the mapping's start.
+- A lock inside a module's data section: find an export that enters it. `ucrtbase.dll`'s
+  `_lock_locales` is `lea <lock>(%rip),%rcx; jmp *EnterCriticalSection`, which named the lock of
+  [how-it-works §29](how-it-works.md#29-altium-hangs-on-start-altiums-ucrtbasedll-and-wines-loader-lock).
+  A critical section's owner is the Wine thread ID at +0x10, its recursion count at +0xc.
+- Each thread's TEB (`$gs_base` in gdb) gives its Windows stack (StackBase at TEB+8,
+  StackLimit at TEB+0x10). A thread that has not reached its start routine yet keeps its
+  initial `CONTEXT` at the top of that stack, with the start routine in it: that is how a
+  thread is traced to the code that created it.
+
 ## Slow redraws: `scripts/redraw-bench.sh` and `scripts/profile.py`
 
 `redraw-bench.sh` measures how expensive a view's redraws are. With a document open, it
