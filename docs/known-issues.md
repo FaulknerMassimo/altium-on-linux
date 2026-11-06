@@ -62,18 +62,38 @@ The fifth time (2026-11-06, after a 19-hour session) was captured in full
   `x2+0x11e19b0` and `AltiumPortalCache.dll!GetPortal`), which was still running and still
   held a lease. In a normal exit, `DXP_Shutdown.log` shows `FinalizeSecurityServerMgr` 1.5 s
   after "Closing Documents".
-- `DXP_Shutdown.log` was not rewritten in this session, so possibly the shutdown sequence
-  that it logs never started. To confirm, check when a normal exit writes that file.
+- The logged shutdown sequence never started. Every start appends to `DXP_Shutdown.log`
+  (a "Removing Server DLL: CollaborateCompareMerge" line); an exit rewrites it, starting
+  with "DXP Shutdown Commenced". In this session it was never rewritten. A normal exit
+  timed with inotify (2026-11-06, `build/exit-test-20261106-1112.*`, 8 s after `WM_CLOSE`):
+  workspace and `.PrjPcbStructure` saved, `ADVPCB.DFT` saved, title "No License",
+  **0.5 s later** "DXP Shutdown Commenced", `Advsch*.dft` and view configurations saved,
+  X2 gone. The hung session did every step up to "No License" and none after it. So
+  killing a hung Altium loses those last settings files too.
+- In between, VCL quits its main loop. X2's `TApplication.Run` (`x2+0x35be40`) loops until
+  `FTerminate` (`Application+0x148`), which only `ProcessMessage` (`x2+0x35b995`) sets, when
+  it takes a `WM_QUIT` off the queue. A `WM_QUIT` that another message loop takes first and
+  does not post again (a .NET/WPF dispatcher, a COM wait, a progress dialog) leaves Altium
+  idling in `Run` forever: the picture seen here. Not proven yet. Next time, post
+  `WM_QUIT` to the main window (`postmsg.exe <TDocumentForm hwnd> 12 0 0`, see below). If
+  "DXP Shutdown Commenced" follows and Altium exits, the quit message was lost, and that
+  is also a clean way out.
+- The hung session ran a git fetch on the Altium 365 project during the close
+  (`.git/FETCH_HEAD` at 09:42:45); the normal test exit did not. The 2026-10-23 hang also
+  came after a save to the server and a Git dialog.
 - Cancel on the Sign In, then a second `WM_CLOSE` to the main window, changed nothing: Altium
   treats itself as already closing.
 - Side finding: a thread-pool callback in X2 (`x2+0x10807a0`) walks every global atom from
   `0xC000` up, one wineserver call per atom. That likely explains why wineserver uses about
   12% CPU while Altium idles.
 
-Next time, before ending it: managed stacks of every thread (`scripts/dotnet-stacks.sh`),
+Next time, first post `WM_QUIT` to the main window (its hwnd is the `TDocumentForm` line of
+`scripts/wininfo.sh`; `postmsg.exe` is built by `scripts/build.sh`):
+`bash -c 'source scripts/lib.sh; load_bottle Altium; mkdir -p "$STAGE/tools"; cp build/postmsg.exe "$STAGE/tools/"; wine_running "$(winpath "$STAGE/tools/postmsg.exe")" <hwnd> 12 0 0'`.
+If Altium is still there, then before ending it: managed stacks of every thread (`scripts/dotnet-stacks.sh`),
 native ones (`scripts/backtrace.sh`, which can take minutes; killing `winedbg` while it is
-attached kills Altium), and `scripts/wininfo.sh`. Nothing is left to save by then, so ending
-the bottle's processes is safe:
+attached kills Altium), and `scripts/wininfo.sh`. No work is left to save by then (only the
+last settings files above), so ending the bottle's processes is safe:
 `bash -c 'source scripts/lib.sh; load_bottle Altium; in_running_bottle "$RUNNER_DIR/bin/wineserver" -k'`.
 A "Sign In" window that appears on its own while Altium hangs on exit is the lease timer;
 Cancel it.
