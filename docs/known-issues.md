@@ -33,7 +33,7 @@ where they ask to be. Hyprland exports the functions involved
 
 ## Altium does not exit after File > Exit
 
-Seen four times (2026-10-10, -12, -23 and -24), each after a session of an hour or more:
+Seen five times (2026-10-10, -12, -23, -24 and 11-06), each after a session of an hour or more:
 the documents close, the license is released (the title becomes `Altium Designer (26.x) -
 No License`), no dialog is open (`scripts/wininfo.sh` lists only `TDocumentForm` and
 `TApplication`), and the process stays, at a few percent CPU. Short sessions exit in a few
@@ -48,11 +48,35 @@ runs that module's own copy of VCL's `Application.Idle` (`DoMouseIdle`: `WindowF
 running, and idling. The exit waits for something that never happens (a background task, a
 thread, a message); what, is not known.
 
+The fifth time (2026-11-06, after a 19-hour session) was captured in full
+(`build/exit-hang-20261106-1055.*`: managed and native stacks of every thread). It showed:
+
+- No thread is stuck. Every .NET thread is an idle thread-pool worker, the X2 worker
+  threads are idle file monitors and empty queues, and the UI thread runs X2's main loop
+  (`TApplication.Run`, `x2+0x35bf34`). This is not a deadlock: the shutdown stopped and
+  nothing told it to carry on.
+- The shutdown stopped after the license was released and before the license manager was
+  shut down. 74 minutes after File > Exit, a modal "Sign In" window (WPF,
+  `Altium.Portal.Factory.UnifiedLogin`) appeared. It came from SecurityServerManager's
+  lease timer (`x2+0x11dd2c0`: interval 20 min, renews any lease that is due, via
+  `x2+0x11e19b0` and `AltiumPortalCache.dll!GetPortal`), which was still running and still
+  held a lease. In a normal exit, `DXP_Shutdown.log` shows `FinalizeSecurityServerMgr` 1.5 s
+  after "Closing Documents".
+- `DXP_Shutdown.log` was not rewritten in this session, so possibly the shutdown sequence
+  that it logs never started. To confirm, check when a normal exit writes that file.
+- Cancel on the Sign In, then a second `WM_CLOSE` to the main window, changed nothing: Altium
+  treats itself as already closing.
+- Side finding: a thread-pool callback in X2 (`x2+0x10807a0`) walks every global atom from
+  `0xC000` up, one wineserver call per atom. That likely explains why wineserver uses about
+  12% CPU while Altium idles.
+
 Next time, before ending it: managed stacks of every thread (`scripts/dotnet-stacks.sh`),
 native ones (`scripts/backtrace.sh`, which can take minutes; killing `winedbg` while it is
 attached kills Altium), and `scripts/wininfo.sh`. Nothing is left to save by then, so ending
 the bottle's processes is safe:
 `bash -c 'source scripts/lib.sh; load_bottle Altium; in_running_bottle "$RUNNER_DIR/bin/wineserver" -k'`.
+A "Sign In" window that appears on its own while Altium hangs on exit is the lease timer;
+Cancel it.
 
 ## An Altium session ended after the lid was closed
 
