@@ -1365,3 +1365,8 @@ copies of each handler, as shipped and as fixed, with its calls into the rest of
   with 16-bit and 32-bit coordinates, and leave the right current position.
 - Leaving out the current-position edits makes the test fail with `(518, …)`, which is
   `[PT_MOVETO, PT_LINETO]` read as a short.
+
+In Altium, a start with the proxy logged the fix for `WorkspaceManager.dll` and
+`Advpcb.dll` (`ItemManager.dll` loads later, on demand). The output job that had hung then
+wrote its 3-page PDF in a few seconds, with every wire, junction and pin drawn, and Altium
+stayed responsive.
