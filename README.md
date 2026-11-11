@@ -276,6 +276,7 @@ keep. Or delete the bottle.
 | Freezes now and then (a Wine thread loses its pipes to wineserver) | cause found: under fsync, Wine closes a random fd each time a thread ends; the fd guard skips those closes ([§20](docs/how-it-works.md#20-freezes-wine-threads-lose-their-pipes-to-wineserver)); not yet confirmed over long sessions |
 | A monitor stuck at 0x0 (a dock reconnecting) | hidden from Wine, which divided by its width and lost Altium's windows ([§21](docs/how-it-works.md#21-a-monitor-stuck-at-0x0-altium-shows-no-window-or-loses-them-all)) |
 | Unplugging a dock while Altium runs | Altium's windows move onto a remaining monitor ([§24](docs/how-it-works.md#24-altium-disappears-when-a-monitor-is-unplugged-a-window-on-no-monitor)); X errors about outputs and windows that went away no longer end Wine's processes ([§25](docs/how-it-works.md#25-wine-processes-exit-after-a-monitor-goes-away-unexpected-x-errors)) |
+| PDF output (output jobs) | the freeze at "Publishing to PDF" is fixed ([§30](docs/how-it-works.md#30-altium-freezes-at-publishing-to-pdf-llpdflib-and-wines-gdi-polydraw)) |
 | Starting Altium | the hang now and then on start (no window) is fixed ([§29](docs/how-it-works.md#29-altium-hangs-on-start-altiums-ucrtbasedll-and-wines-loader-lock)) |
 | Quitting Altium | after a long session, it sometimes stays open with `No License` in the title: [known issues](docs/known-issues.md#altium-does-not-exit-after-file--exit) |
 

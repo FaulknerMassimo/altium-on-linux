@@ -1,0 +1,13 @@
+LIBRARY kernel32.dll
+EXPORTS
+GetStdHandle
+WriteFile
+ExitProcess
+LoadLibraryW
+LoadLibraryExW
+GetEnvironmentVariableW
+CreateThread
+WaitForSingleObject
+TerminateThread
+CloseHandle
+VirtualAlloc

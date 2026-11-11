@@ -17,7 +17,8 @@ Symbols are the nearest exported symbol before the address (pefile for Windows D
 nm -D for Unix libraries): code in an unexported function is listed under a neighbouring
 export, so treat names as hints. The stack scan is heuristic and can count stale frames.
 Wine's Unix side runs on its own stack: a sample taken there shows Unix frames (win32u.so,
-ntdll.so, libc) but not the Windows frames that called them. .NET code appears as [anon].
+ntdll.so, libc) but not the Windows frames that called them. .NET code, and the code of most
+native DLLs (Wine maps their sections anonymously), appears as [anon].
 """
 import argparse
 import bisect

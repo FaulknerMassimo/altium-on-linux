@@ -39,6 +39,7 @@ vkd3d-proton 3.0.1, Hyprland 0.56 (Omarchy) on XWayland, Intel Arc graphics (Mes
 | 27 | Orange box over the installer's dialogs (Hyprland) | a translucent glow window behind each dialog; Hyprland ignores `_NET_WM_WINDOW_OPACITY` and stacks it on top | Hyprland hook sends the glow to the back |
 | 28 | Empty white 800x800 box next to the installer (Hyprland) | the installer's 0x0 `TApplication` window; Hyprland resizes managed X11 windows smaller than 2x2 to 800x800, and Wine follows | zero-size filter (`LD_PRELOAD`) keeps windows smaller than 2x2 unmapped |
 | 29 | Altium hangs on start now and then: no window, ~115 MB, `loader_section wait timed out` every 5 s | Altium's own `ucrtbase.dll` sets up each new thread's CRT data in `DllMain`, under its locale lock, and Wine calls `DllMain` with its loader lock held; the main thread held the locale lock and needed the loader lock (Wine's `GetProcAddress`, `LoadLibrary` and `FindResource` take it) | `SHFolder.dll` proxy turns `ucrtbase.dll`'s thread attach and detach calls off |
+| 30 | Altium freezes at "Publishing to PDF" (an output job's schematic prints): the UI thread at 100% CPU, forever | Altium's PDF writer (llPDFLib) reads the point types of a PolyDraw record 3 bytes too far on and never moves to the next type, so a path of up to 3 points loops forever; Wine's GDI+ draws every path with PolyDraw | `SHFolder.dll` proxy fixes both PolyDraw handlers in place in the three modules that have llPDFLib |
 
 ## 1. ICU error in the installer
 
@@ -1288,3 +1289,79 @@ waits for the lock to free its data (so nothing leaks), and `LoadLibrary` return
 In Altium, 40 headless starts in a row went through with the fix, where one in 11 had hung
 without it, and a session on the real display with a schematic and a PCB open drew both and
 exited normally.
+
+## 30. Altium freezes at "Publishing to PDF" (llPDFLib and Wine's GDI+ PolyDraw)
+
+On 2026-11-10 Altium stopped responding while an output job generated Schematic Prints into a
+PDF container: the status bar read "Publishing to PDF", the UI thread used 100% of a core, its
+memory stayed flat and every other thread was idle. It would never have come back.
+
+- `scripts/profile.py` on the UI thread: all 1702 samples (10 s) on 11 instructions within one
+  function, with the same stack each time, so one call that never returned and made no calls.
+- `scripts/dotnet-stacks.sh` named the managed frames: `PublishManager.Generate_MetaPages` →
+  `PDFPublisher.AppendPage` → `IPDFPageWrapper.PlayMetaFile`, a COM call into Delphi code. The
+  looping function was in `System\WorkspaceManager.dll`, which has llPDFLib (the PDF's
+  `Producer` is "llPDFLib 3.x") compiled in. Each page is drawn into an enhanced metafile,
+  which llPDFLib replays record by record into PDF path operators.
+- The function is llPDFLib's handler for `EMR_POLYDRAW16` (record type 92: `cpts` points of two
+  shorts at `rec + 0x1c`, then one type byte per point, padded to 4 bytes). Its frame held a
+  valid record: a vertical line, 2 points, types `[PT_MOVETO, PT_LINETO]` at `rec + 0x24`.
+
+The handler has three slips:
+
+1. It takes the types from `rec + 4 * (cpts - 1) + 0x23`, which is 3 bytes past where they
+   start (`rec + 0x1c + 4 * cpts`). For this record, that is `rec + 0x27`: padding, 0.
+2. It keeps a point index and a type index, advances only the first, and tests every point
+   against the type byte at the second, which stays 0.
+3. After a line it keeps the next point, not the line's end, as the current position (with
+   the last point, the first type bytes read as a coordinate).
+
+The loop runs while the point index is below `cpts`, and only a `PT_MOVETO`, `PT_LINETO` or
+`PT_BEZIERTO` moves the index on. A type of 0 matches none, so for any path of up to 3 points
+the replay never ends. Longer paths get every point drawn as whatever their fourth type is.
+The handler for `EMR_POLYDRAW` (type 56, points of two ints, which Wine records when a
+coordinate does not fit in a short) has the same three slips.
+
+Windows evidently never records PolyDraw on these pages, or every schematic PDF would hang
+there too. Wine does. Altium draws schematic prints with GDI+, and Wine's `gdiplus.dll` strokes
+and fills every path with `PolyDraw` (`draw_poly` in `dlls/gdiplus/graphics.c`). Fills come
+inside `BeginPath`/`EndPath`, strokes outside a path. The page that hung had 456
+`EMR_POLYDRAW16` records out of 19,088: 319 2-point lines, closed polygons, and 62 circles of
+four Béziers.
+
+Wine's GDI+ could instead record PolyDraw as separate MoveTo, LineTo and PolyBezierTo calls.
+That changes how llPDFLib strokes them (a stroke per record, joins becoming caps), and a close
+would have to be a CloseFigure inside a path but a LineTo outside one. Fixing llPDFLib keeps
+the records as they are. The same handlers, byte for byte apart from call targets, are also in
+`ItemManager.dll` and `Advpcb.dll`.
+
+**Fix:** in the `SHFolder.dll` proxy (item 12). When `WorkspaceManager.dll`, `ItemManager.dll`
+or `Advpcb.dll` loads (or already has, when the proxy loads), the proxy looks in its function
+table (`.pdata`) for functions of the handlers' sizes (0x4d8 and 0x4ae bytes). It accepts one
+only if its code around the type pointer, the loop test and every edit is what the edits
+expect, and then makes eight same-length edits:
+
+- the types at `rec + 0x1c + n * cpts`;
+- each point tested against its own type;
+- a `PT_CLOSEFIGURE`, tested after the index has moved past the point, tested against the type
+  of the point just drawn;
+- the line's end kept as the current position.
+
+Any other build of those modules is left alone. The log says
+`shfolderproxy: llPDFLib's PolyDraw handlers fixed in WorkspaceManager.dll` for each module.
+
+The same edits, minus the current position, were first made by hand in the running Altium
+(through `/proc/<pid>/mem`, with the UI thread stopped). The replay went on, and the PDF came
+out with all three pages drawn.
+
+[`tests/test_polydraw_wine.py`](../tests/test_polydraw_wine.py) maps the bottle's three modules
+in a throwaway prefix (without their imports or `DllMain`) and loads the proxy. It then runs
+copies of each handler, as shipped and as fixed, with its calls into the rest of llPDFLib
+(start a path, the coordinate transforms, MoveTo, LineTo, CurveTo, stroke) sent to stubs:
+
+- As shipped, a 2-point line never returns.
+- As fixed, lines, closed polygons, circles, two figures in one record, a line then a closed
+  Bézier, and a lone MoveTo give exactly the calls PolyDraw means, stroked and inside a path,
+  with 16-bit and 32-bit coordinates, and leave the right current position.
+- Leaving out the current-position edits makes the test fail with `(518, …)`, which is
+  `[PT_MOVETO, PT_LINETO]` read as a short.

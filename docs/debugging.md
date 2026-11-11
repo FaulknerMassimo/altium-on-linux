@@ -71,6 +71,14 @@ which modules each thread is in. A UI thread sitting in `uiautomationcore` is ho
 `tabtip.exe` loop showed up. Note the CPU of each thread first (`top -H -p <pid>`): an
 idle UI thread means a deadlock or an invisible modal dialog, a busy one means a loop.
 
+For a loop, `scripts/profile.py --tid <pid>` (the UI thread's ID is the process ID) shows how
+tight it is. A handful of addresses, always under the same stack, is one call that never
+returns ([how-it-works §30](how-it-works.md#30-altium-freezes-at-publishing-to-pdf-llpdflib-and-wines-gdi-polydraw)).
+`[anon]` there is not only .NET's JIT code: Wine maps the sections of most native DLLs
+anonymously, Altium's Delphi modules among them. To find the module, take each DLL's
+header page in `/proc/<pid>/maps` and its `SizeOfImage` (as in "A start that hangs" below).
+The module's `.pdata` then gives the function's bounds.
+
 .NET frames show up in `winedbg` only as `coreclr+0x...`. `dotnet-stacks.sh` names
 them: it downloads Microsoft's `dotnet-dump`, runs it inside the bottle against Altium's
 own .NET runtime (`DOTNET_ROOT=C:\Program Files\Altium\AD26\System\DotNet\Runtime`),

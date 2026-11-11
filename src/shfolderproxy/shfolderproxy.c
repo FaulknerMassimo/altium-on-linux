@@ -6,8 +6,9 @@
  * shfolder. On load it works around six Wine gaps, in X2.EXE and in every DLL
  * loaded later (via LdrRegisterDllNotification), one VCL bug that shows up
  * under Wine (7), a Wine-on-DXVK slowdown (8), a race in DXVK (9), windows
- * that Wine leaves on no monitor after a display change (10) and a deadlock
- * between Altium's ucrtbase.dll and Wine's loader lock (11):
+ * that Wine leaves on no monitor after a display change (10), a deadlock
+ * between Altium's ucrtbase.dll and Wine's loader lock (11) and a bug in
+ * Altium's PDF writer that Wine's GDI+ brings out (12):
  *
  * 1. Missing user32 functions. Altium delay-loads a few newer user32 functions
  *    that Wine does not export (InheritWindowMonitor is still a stub in upstream
@@ -103,6 +104,14 @@
  *    (DisableThreadLibraryCalls): the CRT then sets a thread's data up on its first use and
  *    frees it from its fiber-local storage callback, outside the loader lock.
  *
+ * 12. Altium freezing at "Publishing to PDF". Altium's PDF writer (llPDFLib) replays each page's
+ *    metafile into the PDF, and its handlers for PolyDraw records find the point types 3 bytes
+ *    too far on and test every point against that one byte. For a path of up to 3 points the
+ *    byte is the record's padding, 0, which no branch handles, and the replay loops forever.
+ *    Windows' GDI+ does not record PolyDraw there; Wine's GDI+ draws every path with it. In the
+ *    three Altium modules that have llPDFLib, both handlers are found by their code and fixed
+ *    in place (same-length edits).
+ *
  * Build: scripts/build.sh (clang + lld-link + llvm-dlltool; no Windows SDK or CRT needed).
  */
 
@@ -137,6 +146,7 @@ IMPORT BOOL DisableThreadLibraryCalls(HMODULE module);
 #define DLL_PROCESS_ATTACH 1
 #define LDR_DLL_NOTIFICATION_REASON_LOADED 1
 #define IMAGE_DIRECTORY_ENTRY_IMPORT 1
+#define IMAGE_DIRECTORY_ENTRY_EXCEPTION 3
 #define IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT 13
 #define IMAGE_ORDINAL_FLAG64 0x8000000000000000ULL
 #define STATUS_SUCCESS 0
@@ -1869,6 +1879,145 @@ static void ucrtbase_loaded(HMODULE base)
         OutputDebugStringA("shfolderproxy: thread attach and detach calls of ucrtbase.dll turned off\n");
 }
 
+/* ---- 12. llPDFLib's PolyDraw handlers (PDF output) ----------------------------- */
+
+/* Altium writes PDFs (output jobs' PDF containers, Smart PDF) with llPDFLib, a Delphi library
+ * compiled into WorkspaceManager.dll, ItemManager.dll and Advpcb.dll. A page is drawn into an
+ * enhanced metafile, which llPDFLib replays record by record into PDF path operators. Its
+ * handlers for EMR_POLYDRAW16 and EMR_POLYDRAW (one point and one type byte per vertex) have
+ * three slips:
+ *
+ * - the types are taken from rec + 0x1f + n * cpts (n = 4 or 8, the size of a point), 3 bytes
+ *   past where they start, at rec + 0x1c + n * cpts;
+ * - every point is tested against that same byte: the loop advances the point index (i, at
+ *   rbp+0x78) but never the type index (rbp+0x7c), which stays 0;
+ * - after a line, the point after it (pts[i] once i has moved on) is kept as the current
+ *   position instead of the line's end.
+ *
+ * The loop runs while i < cpts, and only a PT_MOVETO, PT_LINETO or PT_BEZIERTO type moves i on.
+ * With up to 3 points the byte read is the record's padding, 0: the loop never ends, and Altium
+ * stays at "Publishing to PDF" with its UI thread at 100% CPU (2026-11-10, an output job's
+ * schematic prints). Windows' GDI+ evidently records no PolyDraw on these pages, or every PDF
+ * would hang there too; Wine's GDI+ strokes and fills every path with PolyDraw (draw_poly in
+ * dlls/gdiplus/graphics.c), and that page held 456 of them, 319 of them 2-point lines.
+ *
+ * Both handlers have a fixed size, so they are found in the module's function table and
+ * recognised by their code around the edits; each edit keeps the instructions' lengths. With
+ * them, each point is tested against its own type, a PT_CLOSEFIGURE (tested after i has moved
+ * past the point) against the type of the point just drawn, and a line's end becomes the
+ * current position. Anything else, in any other module, is left alone. */
+
+struct code_edit {
+    WORD offset;
+    const char *code;        /* what must be there, as for code_matches */
+    const char *replacement; /* the same length; 0 for a check only */
+};
+
+/* EMR_POLYDRAW16: points of 2 shorts at rec + 0x1c */
+static const struct code_edit polydraw16_edits[] = {
+    /* types = rec + 4 * (cpts - 1) + 0x23; i = 0; j = 0 */
+    { 0x0c6, "48 8b 85 e8 00 00 00 8b 40 18 83 e8 01 03 c0 03 c0 83 c0 23 89 45 78 48 8b 8d e8 00 00 00 "
+             "8b 55 78 e8 ?? ?? ?? ?? 48 89 45 70 c7 45 78 00 00 00 00 c7 45 7c 00 00 00 00", 0 },
+    /* while i < cpts */
+    { 0x475, "48 8b 85 e8 00 00 00 8b 4d 78 3b 48 18 0f 82 ?? ?? ?? ??", 0 },
+    { 0x0d7, "83 c0 23", "83 c0 20" },                                     /* types: rec + 0x1c + 4 * cpts */
+    { 0x107, "48 63 4d 7c", "48 63 4d 78" },                               /* PT_MOVETO: types[i] */
+    { 0x190, "48 63 4d 7c", "48 63 4d 78" },                               /* PT_LINETO: types[i] */
+    { 0x20b, "48 0f bf 44 88 1c", "48 0f bf 44 88 18" },                   /* current position: */
+    { 0x21e, "48 0f bf 44 88 1e", "48 0f bf 44 88 1a" },                   /*   pts[i - 1] */
+    { 0x246, "48 63 4d 7c 48 0f b6 04 08", "48 63 4d 78 0f b6 44 08 ff" }, /* PT_CLOSEFIGURE: types[i - 1] */
+    { 0x2ad, "48 63 4d 7c", "48 63 4d 78" },                               /* PT_BEZIERTO: types[i] */
+    { 0x41b, "48 63 4d 7c 48 0f b6 04 08", "48 63 4d 78 0f b6 44 08 ff" }, /* PT_CLOSEFIGURE: types[i - 1] */
+};
+
+/* EMR_POLYDRAW: points of 2 ints at rec + 0x1c */
+static const struct code_edit polydraw32_edits[] = {
+    /* types = rec + 8 * (cpts - 1) + 0x27; i = 0; j = 0 */
+    { 0x0c6, "48 8b 85 e8 00 00 00 8b 40 18 83 e8 01 03 c0 03 c0 03 c0 83 c0 27 89 45 78 48 8b 8d e8 00 00 00 "
+             "8b 55 78 e8 ?? ?? ?? ?? 48 89 45 70 c7 45 78 00 00 00 00 c7 45 7c 00 00 00 00", 0 },
+    /* while i < cpts */
+    { 0x44b, "48 8b 85 e8 00 00 00 8b 4d 78 3b 48 18 0f 82 ?? ?? ?? ??", 0 },
+    { 0x0d9, "83 c0 27", "83 c0 24" },                                     /* types: rec + 0x1c + 8 * cpts */
+    { 0x109, "48 63 4d 7c", "48 63 4d 78" },                               /* PT_MOVETO: types[i] */
+    { 0x18e, "48 63 4d 7c", "48 63 4d 78" },                               /* PT_LINETO: types[i] */
+    { 0x201, "8b 44 c8 1c", "8b 44 c8 14" },                               /* current position: */
+    { 0x212, "8b 44 c8 20", "8b 44 c8 18" },                               /*   pts[i - 1] */
+    { 0x238, "48 63 4d 7c 48 0f b6 04 08", "48 63 4d 78 0f b6 44 08 ff" }, /* PT_CLOSEFIGURE: types[i - 1] */
+    { 0x29f, "48 63 4d 7c", "48 63 4d 78" },                               /* PT_BEZIERTO: types[i] */
+    { 0x3f1, "48 63 4d 7c 48 0f b6 04 08", "48 63 4d 78 0f b6 44 08 ff" }, /* PT_CLOSEFIGURE: types[i - 1] */
+};
+
+static const struct {
+    DWORD size; /* of the function, from .pdata */
+    const struct code_edit *edits;
+    unsigned count;
+} polydraw_handlers[] = {
+    { 0x4d8, polydraw16_edits, sizeof(polydraw16_edits) / sizeof(polydraw16_edits[0]) },
+    { 0x4ae, polydraw32_edits, sizeof(polydraw32_edits) / sizeof(polydraw32_edits[0]) },
+};
+
+static const char *const llpdflib_modules[] = { "WorkspaceManager.dll", "ItemManager.dll", "Advpcb.dll" };
+
+typedef struct { DWORD begin, end, unwind; } RUNTIME_FUNCTION;
+
+static BYTE *data_directory(BYTE *base, int index, DWORD *size);
+
+/* Applies the edits to the function at code if every one of them finds its code there. */
+static int apply_edits(BYTE *code, DWORD size, const struct code_edit *edits, unsigned count)
+{
+    DWORD old;
+    unsigned i;
+
+    for (i = 0; i < count; i++)
+        if (edits[i].offset >= size || !code_matches(code + edits[i].offset, size - edits[i].offset, edits[i].code))
+            return 0;
+    if (!VirtualProtect(code, size, PAGE_EXECUTE_READWRITE, &old)) return 0;
+    for (i = 0; i < count; i++) {
+        BYTE *at = code + edits[i].offset;
+        for (const char *p = edits[i].replacement; p && *p; p += p[2] ? 3 : 2)
+            *at++ = (BYTE)(hex_digit(p[0]) << 4 | hex_digit(p[1]));
+    }
+    VirtualProtect(code, size, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, size);
+    return 1;
+}
+
+static void patch_llpdflib(BYTE *base, const char *name)
+{
+    static const char prefix[] = "shfolderproxy: llPDFLib's PolyDraw handlers fixed in ";
+    RUNTIME_FUNCTION *functions;
+    DWORD size, fixed = 0;
+    char msg[96];
+    unsigned n = 0;
+
+    if (!base || !(functions = (RUNTIME_FUNCTION *)data_directory(base, IMAGE_DIRECTORY_ENTRY_EXCEPTION, &size)))
+        return;
+    for (DWORD i = 0; i < size / sizeof(*functions); i++)
+        for (unsigned h = 0; h < sizeof(polydraw_handlers) / sizeof(polydraw_handlers[0]); h++)
+            if (functions[i].end - functions[i].begin == polydraw_handlers[h].size
+                    && apply_edits(base + functions[i].begin, polydraw_handlers[h].size, polydraw_handlers[h].edits,
+                                   polydraw_handlers[h].count))
+                fixed++;
+    if (!fixed) return;
+    for (const char *s = prefix; *s; s++) msg[n++] = *s;
+    for (const char *s = name; *s && n < sizeof(msg) - 2; s++) msg[n++] = *s;
+    msg[n++] = '\n';
+    msg[n] = 0;
+    OutputDebugStringA(msg);
+}
+
+/* The proxy loads before X2.EXE loads these; a test program may have loaded one already. */
+static void patch_llpdflib_loaded(void)
+{
+    for (unsigned m = 0; m < sizeof(llpdflib_modules) / sizeof(llpdflib_modules[0]); m++) {
+        WCHAR name[32];
+        unsigned i = 0;
+        for (; llpdflib_modules[m][i]; i++) name[i] = (WCHAR)llpdflib_modules[m][i];
+        name[i] = 0;
+        patch_llpdflib(GetModuleHandleW(name), llpdflib_modules[m]);
+    }
+}
+
 /* ---- Hooks in Wine's d2d1.dll (6 and 8) ------------------------------------ */
 
 /* On its own thread, like patch_dwrite: d2d1 cannot be used from the load notification. The
@@ -2001,6 +2150,10 @@ static void dll_loaded(DWORD reason, const DLL_NOTIFICATION_DATA *data, void *co
         patch_dxvk_allocator(data->dll_base);
     else if (wname_is(data->base_name->buffer, data->base_name->length / 2, "ucrtbase.dll"))
         ucrtbase_loaded(data->dll_base);
+    else
+        for (unsigned m = 0; m < sizeof(llpdflib_modules) / sizeof(llpdflib_modules[0]); m++)
+            if (wname_is(data->base_name->buffer, data->base_name->length / 2, llpdflib_modules[m]))
+                patch_llpdflib(data->dll_base, llpdflib_modules[m]);
 }
 
 BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
@@ -2018,6 +2171,7 @@ BOOL DllMain(HMODULE self, DWORD reason, void *reserved)
         if (GetModuleHandleW(L"d2d1.dll")) d2d1_loaded(GetModuleHandleW(L"d2d1.dll"));
         if (GetModuleHandleW(L"d3d11.dll")) patch_dxvk_allocator(GetModuleHandleW(L"d3d11.dll"));
         ucrtbase_loaded(GetModuleHandleW(L"ucrtbase.dll"));
+        patch_llpdflib_loaded();
         CreateThread(0, 0, display_watch, self, 0, 0);
     }
     return 1;
